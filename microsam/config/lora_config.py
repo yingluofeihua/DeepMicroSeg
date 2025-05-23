@@ -87,6 +87,7 @@ class DataConfig:
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
+    # prefetch_factor: Optional[int] = None
     
     # 数据过滤
     min_object_size: int = 10

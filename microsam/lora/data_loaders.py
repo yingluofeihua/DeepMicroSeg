@@ -513,7 +513,7 @@ def create_data_loaders(config: DataConfig, dataset_type: str = "standard") -> D
 
 
 def collate_fn(batch):
-    """自定义的批处理函数"""
+    """自定义的批处理函数 - 输出张量而非列表"""
     # 处理变长数据
     images = []
     all_point_coords = []
@@ -522,6 +522,7 @@ def collate_fn(batch):
     all_masks = []
     sample_ids = []
     
+    # 收集所有数据
     for item in batch:
         images.append(item['image'])
         
@@ -532,15 +533,58 @@ def collate_fn(batch):
         if 'boxes' in item:
             all_boxes.append(item['boxes'])
         
+        # 统一处理掩码数据
         if 'ground_truth_masks' in item:
-            all_masks.append(item['ground_truth_masks'])
+            masks = item['ground_truth_masks']
         elif 'masks' in item:
-            all_masks.append(item['masks'])
+            masks = item['masks']
+        else:
+            # 创建默认的空掩码
+            h, w = item['image'].shape[-2:]
+            masks = torch.zeros(1, h, w, dtype=torch.long)
         
+        # 确保掩码是张量格式
+        if not isinstance(masks, torch.Tensor):
+            if isinstance(masks, np.ndarray):
+                masks = torch.from_numpy(masks)
+            else:
+                h, w = item['image'].shape[-2:]
+                masks = torch.zeros(1, h, w, dtype=torch.long)
+        
+        # 确保是3D张量 [N, H, W]
+        if len(masks.shape) == 2:
+            masks = masks.unsqueeze(0)
+        
+        all_masks.append(masks)
         sample_ids.append(item['sample_id'])
     
     # 堆叠图像
     images = torch.stack(images)
+    
+    # 🔧 关键修复：将掩码列表转换为统一的张量
+    if all_masks:
+        # 找到最大对象数和统一尺寸
+        max_objects = max([mask.shape[0] for mask in all_masks])
+        batch_size = len(all_masks)
+        h, w = all_masks[0].shape[-2:]  # 假设所有掩码尺寸相同
+        
+        # 创建统一的掩码张量 [B, max_objects, H, W]
+        unified_masks = torch.zeros(batch_size, max_objects, h, w, dtype=torch.long)
+        
+        for i, masks in enumerate(all_masks):
+            # 确保在同一设备上
+            if images.device != masks.device:
+                masks = masks.to(images.device)
+            
+            # 复制到统一张量中
+            num_objects = min(masks.shape[0], max_objects)
+            unified_masks[i, :num_objects] = masks[:num_objects]
+    
+    else:
+        # 如果没有掩码，创建空张量
+        batch_size = len(images)
+        h, w = images.shape[-2:]
+        unified_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.long)
     
     # 返回批处理数据
     batch_data = {
@@ -548,7 +592,7 @@ def collate_fn(batch):
         'point_coords': all_point_coords,
         'point_labels': all_point_labels,
         'boxes': all_boxes,
-        'ground_truth_masks': all_masks,
+        'ground_truth_masks': unified_masks,  # 🎯 现在是张量！[B, N, H, W]
         'sample_ids': sample_ids
     }
     

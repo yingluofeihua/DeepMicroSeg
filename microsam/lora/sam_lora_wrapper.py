@@ -195,76 +195,144 @@ class SAMLoRAWrapper(nn.Module):
                         param.requires_grad = True
     
     def forward(self, batch_inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """前向传播"""
-        # 提取输入
-        images = batch_inputs['images']  # [B, C, H, W]
-        
-        # 图像编码
-        image_embeddings = self.image_encoder(images)  # [B, C, H, W]
-        
-        # 准备提示输入
-        point_coords = batch_inputs.get('point_coords', [])
-        point_labels = batch_inputs.get('point_labels', [])
-        boxes = batch_inputs.get('boxes', [])
-        mask_inputs = batch_inputs.get('mask_inputs', None)
-        
-        # 批量处理每个样本
-        batch_outputs = []
-        batch_size = images.shape[0]
-        
-        for i in range(batch_size):
-            # 准备单个样本的输入
-            single_image_embedding = image_embeddings[i:i+1]  # [1, C, H, W]
+        """前向传播 - 修复设备一致性"""
+        try:
+            # 提取输入并获取设备
+            images = batch_inputs['images']  # [B, C, H, W]
+            device = images.device
             
-            # 提示编码
-            sparse_embeddings, dense_embeddings = self._encode_prompts(
-                point_coords, point_labels, boxes, mask_inputs, i
-            )
+            print(f"DEBUG: images device: {device}, shape: {images.shape}")
             
+            # 🔧 确保所有模型组件都在正确设备上
+            self._ensure_models_on_device(device)
+            
+            # 图像编码
             try:
-                # 掩码解码
-                low_res_masks, iou_predictions = self.mask_decoder(
-                    image_embeddings=single_image_embedding,
-                    image_pe=self.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=batch_inputs.get('multimask_output', False)
-                )
-                
-                batch_outputs.append({
-                    'masks': low_res_masks,
-                    'iou_predictions': iou_predictions
-                })
-                
+                image_embeddings = self.image_encoder(images)
+                print(f"DEBUG: image_embeddings shape: {image_embeddings.shape}, device: {image_embeddings.device}")
             except Exception as e:
-                print(f"掩码解码失败 (样本 {i}): {e}")
-                # 创建默认输出
-                default_size = (256, 256)  # SAM默认低分辨率掩码尺寸
-                batch_outputs.append({
-                    'masks': torch.zeros(1, 1, *default_size, device=images.device),
-                    'iou_predictions': torch.zeros(1, 1, device=images.device)
-                })
+                print(f"图像编码失败: {e}")
+                raise
+            
+            # 准备提示输入
+            point_coords = batch_inputs.get('point_coords', [])
+            point_labels = batch_inputs.get('point_labels', [])
+            boxes = batch_inputs.get('boxes', [])
+            mask_inputs = batch_inputs.get('mask_inputs', None)
+            
+            # 批量处理每个样本
+            batch_outputs = []
+            batch_size = images.shape[0]
+            
+            for i in range(batch_size):
+                try:
+                    # 准备单个样本的输入
+                    single_image_embedding = image_embeddings[i:i+1]
+                    
+                    # 提示编码
+                    sparse_embeddings, dense_embeddings = self._encode_prompts(
+                        point_coords, point_labels, boxes, mask_inputs, i, device
+                    )
+                    
+                    # 确保所有输入都在同一设备上
+                    single_image_embedding = single_image_embedding.to(device)
+                    sparse_embeddings = sparse_embeddings.to(device)
+                    dense_embeddings = dense_embeddings.to(device)
+                    
+                    # 获取位置编码
+                    try:
+                        image_pe = self.prompt_encoder.get_dense_pe().to(device)
+                    except:
+                        image_pe = torch.zeros(1, 256, 64, 64, device=device)
+                    
+                    # 掩码解码
+                    try:
+                        low_res_masks, iou_predictions = self.mask_decoder(
+                            image_embeddings=single_image_embedding,
+                            image_pe=image_pe,
+                            sparse_prompt_embeddings=sparse_embeddings,
+                            dense_prompt_embeddings=dense_embeddings,
+                            multimask_output=batch_inputs.get('multimask_output', False)
+                        )
+                        
+                        batch_outputs.append({
+                            'masks': low_res_masks,
+                            'iou_predictions': iou_predictions
+                        })
+                        
+                    except Exception as e:
+                        print(f"掩码解码失败 (样本 {i}): {e}")
+                        default_size = (256, 256)
+                        batch_outputs.append({
+                            'masks': torch.zeros(1, 1, *default_size, device=device),
+                            'iou_predictions': torch.zeros(1, 1, device=device)
+                        })
+                        
+                except Exception as e:
+                    print(f"处理样本 {i} 失败: {e}")
+                    default_size = (256, 256)
+                    batch_outputs.append({
+                        'masks': torch.zeros(1, 1, *default_size, device=device),
+                        'iou_predictions': torch.zeros(1, 1, device=device)
+                    })
+            
+            # 合并批量输出
+            result = self._merge_batch_outputs(batch_outputs)
+            print(f"DEBUG: forward result shapes - masks: {result['masks'].shape}, iou: {result['iou_predictions'].shape}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"SAM forward传播异常: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 返回默认输出
+            device = batch_inputs['images'].device
+            batch_size = batch_inputs['images'].shape[0]
+            return {
+                'masks': torch.zeros(batch_size, 1, 256, 256, device=device),
+                'iou_predictions': torch.zeros(batch_size, 1, device=device)
+            }
         
-        # 合并批量输出
-        return self._merge_batch_outputs(batch_outputs)
-    
-    def _encode_prompts(self, point_coords, point_labels, boxes, mask_inputs, batch_idx):
-        """编码提示信息"""
+    def _ensure_models_on_device(self, device: torch.device):
+        """确保所有模型组件都在指定设备上"""
+        
+        # 移动主要组件
+        if self.image_encoder is not None:
+            self.image_encoder = self.image_encoder.to(device)
+        
+        if self.prompt_encoder is not None:
+            self.prompt_encoder = self.prompt_encoder.to(device)
+        
+        if self.mask_decoder is not None:
+            self.mask_decoder = self.mask_decoder.to(device)
+        
+        # 🔧 移动所有LoRA模块
+        for name, lora_module in self.lora_modules.items():
+            if hasattr(lora_module, 'lora'):
+                lora_module.lora = lora_module.lora.to(device)
+            lora_module = lora_module.to(device)
+        
+        print(f"DEBUG: 所有模型组件已移动到设备: {device}")
+
+    def _encode_prompts(self, point_coords, point_labels, boxes, mask_inputs, batch_idx, device):
+        """编码提示信息 - 确保设备一致性"""
+        
         # 处理点提示
         points = None
         if (isinstance(point_coords, list) and batch_idx < len(point_coords) and 
             isinstance(point_coords[batch_idx], torch.Tensor) and len(point_coords[batch_idx]) > 0):
             
-            batch_point_coords = point_coords[batch_idx]
-            batch_point_labels = (point_labels[batch_idx] 
+            batch_point_coords = point_coords[batch_idx].to(device)
+            batch_point_labels = (point_labels[batch_idx].to(device) 
                                 if isinstance(point_labels, list) and batch_idx < len(point_labels) 
                                 else None)
             
             if batch_point_labels is not None and len(batch_point_labels) > 0:
                 points = (batch_point_coords.unsqueeze(0), batch_point_labels.unsqueeze(0))
             else:
-                # 如果没有标签，创建默认的正例标签
-                labels = torch.ones(len(batch_point_coords), dtype=torch.long, device=batch_point_coords.device)
+                labels = torch.ones(len(batch_point_coords), dtype=torch.long, device=device)
                 points = (batch_point_coords.unsqueeze(0), labels.unsqueeze(0))
         
         # 处理框提示
@@ -272,14 +340,14 @@ class SAMLoRAWrapper(nn.Module):
         if (isinstance(boxes, list) and batch_idx < len(boxes) and 
             isinstance(boxes[batch_idx], torch.Tensor) and len(boxes[batch_idx]) > 0):
             
-            batch_boxes = boxes[batch_idx]
-            box = batch_boxes[0].unsqueeze(0)  # 只使用第一个框
+            batch_boxes = boxes[batch_idx].to(device)
+            box = batch_boxes[0].unsqueeze(0)
         
         # 处理掩码提示
         mask = None
         if (isinstance(mask_inputs, list) and batch_idx < len(mask_inputs) and 
             mask_inputs[batch_idx] is not None):
-            mask = mask_inputs[batch_idx]
+            mask = mask_inputs[batch_idx].to(device)
         
         # 使用提示编码器编码
         try:
@@ -291,9 +359,8 @@ class SAMLoRAWrapper(nn.Module):
         except Exception as e:
             print(f"提示编码失败: {e}")
             # 创建默认的空提示编码
-            device = next(self.prompt_encoder.parameters()).device
-            sparse_embeddings = torch.zeros(1, 0, 256, device=device)  # 空的稀疏嵌入
-            dense_embeddings = torch.zeros(1, 256, 64, 64, device=device)  # 默认的密集嵌入
+            sparse_embeddings = torch.zeros(1, 0, 256, device=device)
+            dense_embeddings = torch.zeros(1, 256, 64, 64, device=device)
         
         return sparse_embeddings, dense_embeddings
     

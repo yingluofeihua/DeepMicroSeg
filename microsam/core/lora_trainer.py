@@ -79,8 +79,10 @@ class LoRATrainer:
         
         return device
     
+    # 在 core/lora_trainer.py 中添加设备一致性检查
+
     def setup_model(self) -> bool:
-        """设置SAM LoRA模型"""
+        """设置SAM LoRA模型 - 修复设备一致性"""
         try:
             print("正在设置SAM LoRA模型...")
             
@@ -107,9 +109,22 @@ class LoRATrainer:
                 print("SAM LoRA模型创建失败")
                 return False
             
+            # 🔧 确保模型在正确设备上
+            self.model = self.model.to(self.device)
+            
+            # 🔧 确保所有LoRA模块在正确设备上
+            if hasattr(self.model, 'lora_modules'):
+                for name, lora_module in self.model.lora_modules.items():
+                    if hasattr(lora_module, 'lora'):
+                        lora_module.lora = lora_module.lora.to(self.device)
+                    lora_module = lora_module.to(self.device)
+            
             # 打印模型信息
             self.model.print_model_info()
             print_model_summary(self.model)
+            
+            # 🔧 验证模型设备一致性
+            self._verify_model_device_consistency()
             
             return True
             
@@ -118,6 +133,41 @@ class LoRATrainer:
             import traceback
             traceback.print_exc()
             return False
+
+    def _verify_model_device_consistency(self):
+        """验证模型设备一致性"""
+        print(f"\n验证模型设备一致性...")
+        
+        device_counts = {}
+        
+        # 检查主要组件
+        for name, module in [
+            ('image_encoder', self.model.image_encoder),
+            ('prompt_encoder', self.model.prompt_encoder), 
+            ('mask_decoder', self.model.mask_decoder)
+        ]:
+            if module is not None:
+                for param_name, param in module.named_parameters():
+                    device = str(param.device)
+                    device_counts[device] = device_counts.get(device, 0) + 1
+        
+        # 检查LoRA模块
+        if hasattr(self.model, 'lora_modules'):
+            for lora_name, lora_module in self.model.lora_modules.items():
+                if hasattr(lora_module, 'lora'):
+                    for param_name, param in lora_module.lora.named_parameters():
+                        device = str(param.device)
+                        device_counts[device] = device_counts.get(device, 0) + 1
+        
+        print(f"设备分布: {device_counts}")
+        
+        if len(device_counts) > 1:
+            print(f"⚠️  发现多个设备，正在统一到 {self.device}")
+            # 强制移动所有组件
+            self.model = self.model.to(self.device)
+            print(f"✅ 所有模型组件已移动到 {self.device}")
+        else:
+            print(f"✅ 所有模型组件都在 {self.device} 上")
     
     def setup_data_loaders(self) -> bool:
         """设置数据加载器"""
@@ -297,30 +347,30 @@ class LoRATrainer:
         )
         
         for batch_idx, batch in enumerate(progress_bar):
-            try:
-                # 执行训练步骤
-                step_metrics = training_step_fn(batch)
+            # try:
+            # 执行训练步骤
+            step_metrics = training_step_fn(batch)
+            
+            # 更新统计
+            if 'error' not in step_metrics:
+                epoch_metrics.update(step_metrics)
+                self.global_step += 1
                 
-                # 更新统计
-                if 'error' not in step_metrics:
-                    epoch_metrics.update(step_metrics)
-                    self.global_step += 1
-                    
-                    # 更新进度条
-                    progress_bar.set_postfix({
-                        'loss': f"{step_metrics.get('total_loss', 0):.4f}",
-                        'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
-                    })
-                    
-                    # 记录步骤日志
-                    if self.global_step % self.config.training.logging_steps == 0:
-                        self.log_step_metrics(step_metrics, batch_idx)
-                else:
-                    print(f"批次 {batch_idx} 处理失败")
+                # 更新进度条
+                progress_bar.set_postfix({
+                    'loss': f"{step_metrics.get('total_loss', 0):.4f}",
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                })
                 
-            except Exception as e:
-                print(f"训练步骤失败 (批次 {batch_idx}): {e}")
-                continue
+                # 记录步骤日志
+                if self.global_step % self.config.training.logging_steps == 0:
+                    self.log_step_metrics(step_metrics, batch_idx)
+            else:
+                print(f"批次 {batch_idx} 处理失败")
+                
+            # except Exception as e:
+            #     print(f"训练步骤失败 (批次 {batch_idx}): {e}")
+            #     continue
         
         # 计算epoch平均指标
         avg_metrics = epoch_metrics.compute()

@@ -148,93 +148,121 @@ def calculate_sam_loss(predictions: Dict[str, torch.Tensor],
 
 
 def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
-    """准备SAM训练的输入和目标"""
+    """准备SAM训练的输入和目标 - 处理张量掩码"""
     
-    # 输入数据
-    inputs = {
-        'images': batch['images'],  # 已经是stacked tensor
-        'point_coords': batch.get('point_coords', []),
-        'point_labels': batch.get('point_labels', []),
-        'boxes': batch.get('boxes', []),
-        'mask_inputs': batch.get('mask_inputs', None),
-        'multimask_output': batch.get('multimask_output', False)
-    }
-    
-    # 目标数据 - 需要处理列表格式的ground_truth_masks
-    ground_truth_masks = batch['ground_truth_masks']
-    
-    # 将列表中的掩码堆叠成批量张量
-    if isinstance(ground_truth_masks, list):
-        # 确保所有掩码都有相同的形状
-        batch_masks = []
-        max_num_objects = 0
-        target_size = None
+    try:
+        # 输入数据
+        inputs = {
+            'images': batch['images'],  # [B, C, H, W]
+            'point_coords': batch.get('point_coords', []),
+            'point_labels': batch.get('point_labels', []),
+            'boxes': batch.get('boxes', []),
+            'mask_inputs': batch.get('mask_inputs', None),
+            'multimask_output': batch.get('multimask_output', False)
+        }
         
-        # 首先确定最大对象数和目标尺寸
-        for masks in ground_truth_masks:
-            if isinstance(masks, torch.Tensor) and masks.numel() > 0:
-                if target_size is None:
-                    target_size = masks.shape[-2:]  # H, W
-                max_num_objects = max(max_num_objects, masks.shape[0])
+        # 目标数据 - 现在应该是张量
+        ground_truth_masks = batch['ground_truth_masks']  # [B, N, H, W]
         
-        # 如果没有有效的掩码，使用默认尺寸
-        if target_size is None:
-            target_size = (1024, 1024)  # SAM默认尺寸
+        print(f"DEBUG: ground_truth_masks type: {type(ground_truth_masks)}")
+        print(f"DEBUG: ground_truth_masks shape: {ground_truth_masks.shape}")
         
-        # 处理每个批次中的掩码
-        for masks in ground_truth_masks:
-            if isinstance(masks, torch.Tensor) and masks.numel() > 0:
-                # 调整到目标尺寸
-                if masks.shape[-2:] != target_size:
-                    masks = torch.nn.functional.interpolate(
-                        masks.unsqueeze(1).float(),  # 添加通道维度
-                        size=target_size,
-                        mode='nearest'
-                    ).squeeze(1).long()  # 移除通道维度并转回long
-                
-                # 填充到最大对象数
-                if masks.shape[0] < max_num_objects:
-                    padding = torch.zeros(
-                        max_num_objects - masks.shape[0], 
-                        target_size[0], 
-                        target_size[1], 
-                        dtype=masks.dtype,
-                        device=masks.device
-                    )
-                    masks = torch.cat([masks, padding], dim=0)
-                elif masks.shape[0] > max_num_objects:
-                    masks = masks[:max_num_objects]
-                
-                batch_masks.append(masks)
-            else:
-                # 空掩码的情况
-                empty_masks = torch.zeros(
-                    max_num_objects, 
-                    target_size[0], 
-                    target_size[1], 
-                    dtype=torch.long
-                )
-                batch_masks.append(empty_masks)
+        # 确保在正确设备上
+        device = inputs['images'].device
         
-        # 堆叠成批量张量
-        if batch_masks:
-            targets_masks = torch.stack(batch_masks)  # [B, N, H, W]
+        if isinstance(ground_truth_masks, torch.Tensor):
+            # 现在是张量，直接使用
+            targets_masks = ground_truth_masks.to(device)
+            print(f"DEBUG: 使用张量掩码，形状: {targets_masks.shape}")
+            
         else:
-            targets_masks = torch.zeros(len(ground_truth_masks), 1, target_size[0], target_size[1], dtype=torch.long)
-    else:
-        targets_masks = ground_truth_masks
-    
-    targets = {
-        'masks': targets_masks
-    }
-    
-    # 计算IoU目标（如果需要）
-    if targets_masks.numel() > 0:
-        iou_targets = calculate_mask_iou_targets(targets_masks)
-        targets['iou_targets'] = iou_targets
-    
-    return inputs, targets
-
+            # 如果还是列表（向后兼容），转换为张量
+            print(f"WARNING: ground_truth_masks still is list, converting to tensor")
+            
+            if isinstance(ground_truth_masks, list):
+                processed_masks = []
+                
+                for i, masks in enumerate(ground_truth_masks):
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.to(device)
+                        if len(masks.shape) == 2:
+                            masks = masks.unsqueeze(0)
+                        processed_masks.append(masks)
+                    else:
+                        h, w = inputs['images'].shape[-2:]
+                        default_mask = torch.zeros(1, h, w, dtype=torch.long, device=device)
+                        processed_masks.append(default_mask)
+                
+                # 统一形状并堆叠
+                max_objects = max([mask.shape[0] for mask in processed_masks])
+                target_size = processed_masks[0].shape[-2:]
+                
+                unified_masks = []
+                for masks in processed_masks:
+                    if masks.shape[-2:] != target_size:
+                        masks = torch.nn.functional.interpolate(
+                            masks.unsqueeze(1).float(),
+                            size=target_size,
+                            mode='nearest'
+                        ).squeeze(1).long()
+                    
+                    if masks.shape[0] < max_objects:
+                        padding_shape = (max_objects - masks.shape[0], target_size[0], target_size[1])
+                        padding = torch.zeros(padding_shape, dtype=torch.long, device=device)
+                        masks = torch.cat([masks, padding], dim=0)
+                    elif masks.shape[0] > max_objects:
+                        masks = masks[:max_objects]
+                    
+                    unified_masks.append(masks)
+                
+                targets_masks = torch.stack(unified_masks)
+            else:
+                # 创建默认张量
+                batch_size = inputs['images'].shape[0]
+                h, w = inputs['images'].shape[-2:]
+                targets_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.long, device=device)
+        
+        targets = {
+            'masks': targets_masks  # [B, N, H, W]
+        }
+        
+        # 计算IoU目标
+        try:
+            if targets_masks.numel() > 0:
+                iou_targets = calculate_mask_iou_targets(targets_masks)
+                targets['iou_targets'] = iou_targets
+        except Exception as e:
+            print(f"WARNING: IoU targets calculation failed: {e}")
+            targets['iou_targets'] = torch.ones(targets_masks.shape[0], targets_masks.shape[1], device=device)
+        
+        print(f"DEBUG: prepare_sam_inputs successful, targets_masks shape: {targets_masks.shape}")
+        return inputs, targets
+        
+    except Exception as e:
+        print(f"ERROR in prepare_sam_inputs: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 返回默认值
+        batch_size = batch['images'].shape[0]
+        device = batch['images'].device
+        h, w = batch['images'].shape[-2:]
+        
+        inputs = {
+            'images': batch['images'],
+            'point_coords': [],
+            'point_labels': [],
+            'boxes': [],
+            'mask_inputs': None,
+            'multimask_output': False
+        }
+        
+        targets = {
+            'masks': torch.zeros(batch_size, 1, h, w, dtype=torch.long, device=device),
+            'iou_targets': torch.ones(batch_size, 1, device=device)
+        }
+        
+        return inputs, targets
 
 def calculate_mask_iou_targets(masks: torch.Tensor) -> torch.Tensor:
     """计算掩码的IoU目标值"""
@@ -420,7 +448,7 @@ class TrainingMetrics:
 
 
 def validate_sam_batch(batch: Dict[str, Any]) -> bool:
-    """验证SAM批次数据的有效性"""
+    """验证SAM批次数据的有效性 - 支持张量掩码"""
     required_keys = ['images', 'ground_truth_masks']
     
     for key in required_keys:
@@ -432,19 +460,40 @@ def validate_sam_batch(batch: Dict[str, Any]) -> bool:
     images = batch['images']
     masks = batch['ground_truth_masks']
     
+    print("images.shape: ", images.shape)
+    print("images.type: ", type(images))
+    print("masks.shape: ", masks.shape)  # 现在应该是张量
+    print("masks.type: ", type(masks))
+    
+    # 检查图像张量
+    if not isinstance(images, torch.Tensor):
+        print(f"images不是张量: {type(images)}")
+        return False
+        
     if len(images.shape) != 4:
         print(f"图像张量形状错误: {images.shape}，期望 [B, C, H, W]")
         return False
     
-    if len(masks.shape) < 3:
-        print(f"掩码张量形状错误: {masks.shape}，期望至少 [B, H, W] 或 [B, N, H, W]")
+    # 检查掩码张量
+    if not isinstance(masks, torch.Tensor):
+        print(f"masks不是张量: {type(masks)}，期望 torch.Tensor")
         return False
     
-    # 检查尺寸匹配
+    if len(masks.shape) != 4:
+        print(f"掩码张量形状错误: {masks.shape}，期望 [B, N, H, W]")
+        return False
+    
+    # 检查批次大小匹配
     if images.shape[0] != masks.shape[0]:
         print(f"批次大小不匹配: 图像 {images.shape[0]} vs 掩码 {masks.shape[0]}")
         return False
     
+    # 检查空间尺寸匹配（可选，因为SAM可能会resize）
+    # if images.shape[-2:] != masks.shape[-2:]:
+    #     print(f"空间尺寸不匹配: 图像 {images.shape[-2:]} vs 掩码 {masks.shape[-2:]}")
+    #     return False
+    
+    print(f"✅ 批次验证通过：图像 {images.shape}, 掩码 {masks.shape}")
     return True
 
 

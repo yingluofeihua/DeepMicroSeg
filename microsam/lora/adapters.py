@@ -54,8 +54,10 @@ class LoRALayer(nn.Module):
         return self.lora_B(self.dropout(self.lora_A(x))) * self.scaling
 
 
+# 在 lora/adapters.py 中修复 LoRALinear 类
+
 class LoRALinear(nn.Module):
-    """带LoRA的线性层"""
+    """带LoRA的线性层 - 修复设备一致性"""
     
     def __init__(
         self,
@@ -71,7 +73,10 @@ class LoRALinear(nn.Module):
         for param in self.original_layer.parameters():
             param.requires_grad = False
         
-        # LoRA适配器
+        # 获取原始层的设备
+        device = next(self.original_layer.parameters()).device
+        
+        # LoRA适配器 - 确保在正确设备上
         self.lora = LoRALayer(
             in_features=original_layer.in_features,
             out_features=original_layer.out_features,
@@ -79,26 +84,37 @@ class LoRALinear(nn.Module):
             alpha=alpha,
             dropout=dropout,
             bias=original_layer.bias is not None
-        )
+        ).to(device)  # 🔧 确保LoRA在正确设备上
         
         # 是否启用LoRA
         self.enable_lora = True
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播"""
+        """前向传播 - 确保设备一致性"""
+        # 确保LoRA层在与输入相同的设备上
+        if self.lora.lora_A.weight.device != x.device:
+            self.lora = self.lora.to(x.device)
+        
         # 原始层输出
         output = self.original_layer(x)
         
         # 添加LoRA输出
         if self.enable_lora:
-            output = output + self.lora(x)
+            lora_output = self.lora(x)
+            output = output + lora_output
         
         return output
     
     def merge_weights(self):
-        """将LoRA权重合并到原始权重中"""
+        """将LoRA权重合并到原始权重中 - 修复设备一致性"""
         if not self.enable_lora:
             return
+        
+        # 确保所有张量在同一设备上
+        device = self.original_layer.weight.device
+        
+        # 将LoRA权重移动到正确设备
+        self.lora = self.lora.to(device)
         
         # 计算LoRA权重
         lora_weight = self.lora.lora_B.weight @ self.lora.lora_A.weight * self.lora.scaling
@@ -113,9 +129,15 @@ class LoRALinear(nn.Module):
         self.enable_lora = False
     
     def unmerge_weights(self):
-        """从原始权重中分离LoRA权重"""
+        """从原始权重中分离LoRA权重 - 修复设备一致性"""
         if self.enable_lora:
             return
+        
+        # 确保所有张量在同一设备上
+        device = self.original_layer.weight.device
+        
+        # 将LoRA权重移动到正确设备
+        self.lora = self.lora.to(device)
         
         # 计算LoRA权重
         lora_weight = self.lora.lora_B.weight @ self.lora.lora_A.weight * self.lora.scaling

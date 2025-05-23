@@ -1,6 +1,7 @@
 """
-LoRA训练主入口文件
+LoRA训练主入口文件 (修改版)
 支持LoRA微调和评测的完整流程
+使用新的SAM模型架构
 """
 
 import sys
@@ -19,12 +20,13 @@ from core.dataset_manager import DatasetManager
 from config.settings import BatchEvaluationSettings
 from lora.data_loaders import split_dataset
 from utils.file_utils import setup_logging
+from utils.model_utils import get_device_info, optimize_memory
 
 
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="LoRA微调训练系统",
+        description="SAM LoRA微调训练系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
@@ -45,6 +47,9 @@ def parse_arguments():
   
   # 训练后自动评测
   python lora_main.py train-and-eval --data-dir /path/to/data --eval-data /path/to/eval
+  
+  # 准备数据
+  python lora_main.py prepare-data --data-dir /path/to/data
         """
     )
     
@@ -75,6 +80,11 @@ def parse_arguments():
     data_parser.add_argument('--train-ratio', type=float, default=0.8, help='训练集比例')
     data_parser.add_argument('--val-ratio', type=float, default=0.1, help='验证集比例')
     
+    # 模型信息命令
+    info_parser = subparsers.add_parser('info', help='显示模型和系统信息')
+    info_parser.add_argument('--model', choices=['vit_t_lm', 'vit_b_lm', 'vit_l_lm'], 
+                            default='vit_b_lm', help='模型类型')
+    
     # 通用参数
     parser.add_argument('--verbose', '-v', action='store_true', help='详细输出')
     parser.add_argument('--debug', action='store_true', help='调试模式')
@@ -100,6 +110,8 @@ def add_train_arguments(parser):
     parser.add_argument('--rank', type=int, default=8, help='LoRA rank')
     parser.add_argument('--alpha', type=float, default=16.0, help='LoRA alpha')
     parser.add_argument('--dropout', type=float, default=0.1, help='LoRA dropout')
+    parser.add_argument('--lora-target', choices=['image_encoder', 'mask_decoder', 'both'],
+                       default='image_encoder', help='LoRA应用目标')
     
     # 训练配置
     parser.add_argument('--epochs', type=int, default=10, help='训练轮数')
@@ -108,9 +120,9 @@ def add_train_arguments(parser):
     parser.add_argument('--weight-decay', type=float, default=0.01, help='权重衰减')
     
     # 实验配置
-    parser.add_argument('--experiment-name', default='lora_finetune', help='实验名称')
+    parser.add_argument('--experiment-name', default='sam_lora_finetune', help='实验名称')
     parser.add_argument('--use-wandb', action='store_true', help='使用Weights & Biases')
-    parser.add_argument('--wandb-project', default='micro_sam_lora', help='W&B项目名')
+    parser.add_argument('--wandb-project', default='sam_lora_training', help='W&B项目名')
 
 
 def add_eval_arguments(parser):
@@ -165,6 +177,15 @@ def create_config_from_args(args) -> LoRATrainingSettings:
     if hasattr(args, 'dropout'):
         config.lora.dropout = args.dropout
     
+    # LoRA目标设置
+    if hasattr(args, 'lora_target'):
+        if args.lora_target == 'image_encoder':
+            config.model.apply_lora_to = ['image_encoder']
+        elif args.lora_target == 'mask_decoder':
+            config.model.apply_lora_to = ['mask_decoder']
+        elif args.lora_target == 'both':
+            config.model.apply_lora_to = ['image_encoder', 'mask_decoder']
+    
     # 训练参数
     if hasattr(args, 'epochs'):
         config.training.num_epochs = args.epochs
@@ -186,18 +207,56 @@ def create_config_from_args(args) -> LoRATrainingSettings:
     # 调试模式
     if hasattr(args, 'debug') and args.debug:
         config.experiment.debug_mode = True
-        config.training.num_epochs = 1
+        config.training.num_epochs = 2
         config.training.batch_size = 2
         config.training.save_steps = 10
+        config.training.eval_steps = 5
+        config.training.logging_steps = 1
+        print("调试模式已启用")
     
     return config
+
+
+def check_system_requirements():
+    """检查系统要求"""
+    print("检查系统要求...")
+    
+    # 检查PyTorch
+    print(f"PyTorch版本: {torch.__version__}")
+    
+    # 检查设备信息
+    device_info = get_device_info()
+    print(f"CUDA可用: {device_info['cuda_available']}")
+    
+    if device_info['cuda_available']:
+        print(f"GPU数量: {device_info['cuda_device_count']}")
+        for gpu_name, gpu_info in device_info['gpu_memory'].items():
+            print(f"  {gpu_name}: {gpu_info['name']}, "
+                  f"内存: {gpu_info['total_memory'] / 1e9:.1f} GB")
+    
+    # 检查内存
+    cpu_memory = device_info['cpu_memory']
+    print(f"CPU内存: {cpu_memory['total'] / 1e9:.1f} GB "
+          f"(可用: {cpu_memory['available'] / 1e9:.1f} GB)")
+    
+    # 检查micro_sam
+    try:
+        import micro_sam
+        print(f"micro_sam已安装")
+    except ImportError:
+        print("警告: micro_sam未安装，可能影响模型加载")
+    
+    print("系统检查完成\n")
 
 
 def train_lora_model(args) -> str:
     """训练LoRA模型"""
     print("="*60)
-    print("开始LoRA微调训练")
+    print("开始SAM LoRA微调训练")
     print("="*60)
+    
+    # 检查系统要求
+    check_system_requirements()
     
     # 创建配置
     config = create_config_from_args(args)
@@ -210,12 +269,17 @@ def train_lora_model(args) -> str:
     # 打印配置信息
     print(f"\n训练配置:")
     print(f"  基础模型: {config.model.base_model_name}")
-    print(f"  LoRA rank: {config.lora.rank}")
-    print(f"  LoRA alpha: {config.lora.alpha}")
-    print(f"  学习率: {config.training.learning_rate}")
-    print(f"  批大小: {config.training.batch_size}")
-    print(f"  训练轮数: {config.training.num_epochs}")
+    print(f"  LoRA配置:")
+    print(f"    rank: {config.lora.rank}")
+    print(f"    alpha: {config.lora.alpha}")
+    print(f"    dropout: {config.lora.dropout}")
+    print(f"    应用到: {config.model.apply_lora_to}")
+    print(f"  训练配置:")
+    print(f"    学习率: {config.training.learning_rate}")
+    print(f"    批大小: {config.training.batch_size}")
+    print(f"    训练轮数: {config.training.num_epochs}")
     print(f"  输出目录: {config.experiment.output_dir}")
+    print(f"  数据目录: {config.data.train_data_dir}")
     
     # 创建训练器
     trainer = LoRATrainer(config)
@@ -235,7 +299,7 @@ def train_lora_model(args) -> str:
 def resume_lora_training(args) -> str:
     """恢复LoRA训练"""
     print("="*60)
-    print("恢复LoRA训练")
+    print("恢复SAM LoRA训练")
     print("="*60)
     
     trainer = resume_training(args.checkpoint, args.config)
@@ -253,7 +317,7 @@ def resume_lora_training(args) -> str:
 def evaluate_lora_model(args, lora_model_path: str = None) -> bool:
     """评测LoRA模型"""
     print("="*60)
-    print("开始LoRA模型评测")
+    print("开始SAM LoRA模型评测")
     print("="*60)
     
     # 确定模型路径
@@ -270,33 +334,123 @@ def evaluate_lora_model(args, lora_model_path: str = None) -> bool:
         print("错误: 未指定评测数据目录")
         return False
     
-    # 创建评测配置
-    eval_config = BatchEvaluationSettings()
-    
-    if hasattr(args, 'eval_output') and args.eval_output:
-        eval_config.output_base_dir = args.eval_output
-    else:
-        eval_config.output_base_dir = str(Path(lora_model_path).parent / "evaluation_results")
-    
-    # 设置模型（这里需要扩展支持LoRA模型）
-    # 暂时使用原始模型配置
-    
-    # 创建评测器
-    evaluator = BatchEvaluator(eval_config)
-    
-    # 设置评测环境
-    if not evaluator.setup(eval_data_dir):
-        print("评测环境设置失败")
-        return False
-    
-    # 运行评测
-    success = evaluator.run_evaluation()
-    
-    if success:
-        print(f"\n评测完成! 结果保存在: {eval_config.output_base_dir}")
+    try:
+        # 加载LoRA模型进行评测
+        from lora.sam_lora_wrapper import load_sam_lora_model
+        from core.metrics import ComprehensiveMetrics
+        from lora.data_loaders import create_data_loaders
+        from config.lora_config import DataConfig
+        
+        print(f"LoRA模型路径: {lora_model_path}")
+        print(f"评测数据目录: {eval_data_dir}")
+        
+        # 创建评测数据加载器
+        data_config = DataConfig()
+        data_config.test_data_dir = eval_data_dir
+        
+        data_loaders = create_data_loaders(data_config, dataset_type="sam")
+        if 'test' not in data_loaders:
+            print("无法创建测试数据加载器")
+            return False
+        
+        test_loader = data_loaders['test']
+        print(f"测试数据: {len(test_loader)} 批次")
+        
+        # 加载LoRA模型
+        model_type = "vit_b_lm"  # 默认模型类型，可以从配置中读取
+        lora_model = load_sam_lora_model(model_type, lora_model_path)
+        
+        if lora_model is None:
+            print("LoRA模型加载失败")
+            return False
+        
+        print("LoRA模型加载成功")
+        
+        # 创建指标计算器
+        metrics_calculator = ComprehensiveMetrics()
+        
+        # 进行评测
+        lora_model.eval()
+        all_results = []
+        
+        print("开始评测...")
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_loader):
+                if batch_idx >= 10:  # 限制评测数量
+                    break
+                
+                try:
+                    # 准备输入
+                    from lora.training_utils import prepare_sam_inputs
+                    inputs, targets = prepare_sam_inputs(batch)
+                    
+                    # 模型预测
+                    predictions = lora_model(inputs)
+                    
+                    # 计算指标
+                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    target_masks = targets['masks'].cpu().numpy()
+                    
+                    for pred, target in zip(pred_masks, target_masks):
+                        if pred.ndim > 2:
+                            pred = pred[0]
+                        if target.ndim > 2:
+                            target = target[0]
+                        
+                        pred_binary = (pred > 0.5).astype(int)
+                        target_binary = (target > 0.5).astype(int)
+                        
+                        result = metrics_calculator.compute_all_metrics(target_binary, pred_binary)
+                        all_results.append(result.to_dict())
+                
+                except Exception as e:
+                    print(f"评测批次 {batch_idx} 失败: {e}")
+                    continue
+        
+        # 计算平均指标
+        if all_results:
+            avg_metrics = {}
+            for key in all_results[0].keys():
+                values = [r[key] for r in all_results if key in r and r[key] is not None]
+                if values:
+                    if key == 'hd95':
+                        finite_values = [v for v in values if not (v == float('inf') or v != v)]
+                        avg_metrics[key] = sum(finite_values) / len(finite_values) if finite_values else float('inf')
+                    else:
+                        avg_metrics[key] = sum(values) / len(values)
+            
+            print(f"\n评测结果 (基于 {len(all_results)} 个样本):")
+            for key, value in avg_metrics.items():
+                print(f"  {key}: {value:.4f}")
+            
+            # 保存结果
+            if hasattr(args, 'eval_output') and args.eval_output:
+                output_dir = Path(args.eval_output)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                results_file = output_dir / "lora_evaluation_results.json"
+                with open(results_file, 'w') as f:
+                    json.dump({
+                        'average_metrics': avg_metrics,
+                        'individual_results': all_results,
+                        'model_path': lora_model_path,
+                        'data_path': eval_data_dir
+                    }, f, indent=2)
+                
+                print(f"评测结果已保存到: {results_file}")
+        
+        else:
+            print("没有有效的评测结果")
+            return False
+        
+        print("LoRA模型评测完成!")
         return True
-    else:
-        print("\n评测失败!")
+        
+    except Exception as e:
+        print(f"LoRA模型评测失败: {e}")
+        if hasattr(args, 'verbose') and args.verbose:
+            import traceback
+            traceback.print_exc()
         return False
 
 
@@ -318,6 +472,50 @@ def prepare_training_data(args):
         print("数据准备完成!")
     except Exception as e:
         print(f"数据准备失败: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+
+
+def show_model_info(args):
+    """显示模型和系统信息"""
+    print("="*60)
+    print("模型和系统信息")
+    print("="*60)
+    
+    # 系统信息
+    check_system_requirements()
+    
+    # 尝试加载模型信息
+    try:
+        from core.sam_model_loader import create_sam_model_loader
+        from utils.model_utils import print_model_summary
+        
+        print(f"正在加载模型信息: {args.model}")
+        
+        loader = create_sam_model_loader(args.model, "cpu")  # 使用CPU加载以节省显存
+        if loader.load_model():
+            print("\n模型加载成功!")
+            
+            # 打印模型组件信息
+            components = loader.get_trainable_components()
+            print(f"\n模型组件:")
+            for name, component in components.items():
+                param_count = sum(p.numel() for p in component.parameters())
+                print(f"  {name}: {param_count:,} 参数")
+            
+            # 打印详细的模型摘要（如果有完整模型）
+            if loader.model is not None:
+                print_model_summary(loader.model)
+            
+        else:
+            print("模型加载失败")
+    
+    except Exception as e:
+        print(f"获取模型信息失败: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
 
 
 def main():
@@ -356,6 +554,9 @@ def main():
         elif args.command == 'prepare-data':
             prepare_training_data(args)
         
+        elif args.command == 'info':
+            show_model_info(args)
+        
         else:
             print(f"未知命令: {args.command}")
     
@@ -366,6 +567,9 @@ def main():
         if args.verbose:
             import traceback
             traceback.print_exc()
+    finally:
+        # 清理资源
+        optimize_memory()
 
 
 if __name__ == "__main__":

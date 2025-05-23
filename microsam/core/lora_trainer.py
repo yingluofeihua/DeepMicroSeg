@@ -1,6 +1,7 @@
 """
-LoRA训练器
+LoRA训练器 (修改版)
 负责LoRA模型的训练、验证和保存
+使用新的SAM模型加载架构
 """
 
 import torch
@@ -17,15 +18,16 @@ from tqdm import tqdm
 import wandb
 
 from config.lora_config import LoRATrainingSettings
-from lora.adapters import LoRAModelWrapper, create_lora_model
+from lora.sam_lora_wrapper import SAMLoRAWrapper, create_sam_lora_model
 from lora.data_loaders import create_data_loaders
-from core.model_handler import ModelHandler, ModelConfig
+from lora.training_utils import SAMLoss, prepare_sam_inputs, TrainingMetrics, create_sam_training_step
 from core.metrics import ComprehensiveMetrics, MetricsResult
 from utils.file_utils import setup_logging
+from utils.model_utils import optimize_memory, get_device_info, print_model_summary
 
 
 class LoRATrainer:
-    """LoRA训练器"""
+    """LoRA训练器 - 使用新的SAM架构"""
     
     def __init__(self, config: LoRATrainingSettings):
         self.config = config
@@ -36,6 +38,7 @@ class LoRATrainer:
         self.optimizer = None
         self.scheduler = None
         self.data_loaders = {}
+        self.loss_fn = None
         self.metrics_calculator = ComprehensiveMetrics()
         
         # 训练状态
@@ -65,52 +68,62 @@ class LoRATrainer:
         print(f"使用设备: {device}")
         
         if device.type == "cuda":
-            print(f"GPU设备数量: {torch.cuda.device_count()}")
+            device_info = get_device_info()
+            print(f"GPU设备数量: {device_info['cuda_device_count']}")
             print(f"当前GPU: {torch.cuda.current_device()}")
-            print(f"GPU内存: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
+            if device_info['gpu_memory']:
+                current_gpu = f"gpu_{torch.cuda.current_device()}"
+                if current_gpu in device_info['gpu_memory']:
+                    gpu_info = device_info['gpu_memory'][current_gpu]
+                    print(f"GPU内存: {gpu_info['total_memory'] / 1e9:.1f} GB")
         
         return device
     
     def setup_model(self) -> bool:
-        """设置模型"""
+        """设置SAM LoRA模型"""
         try:
-            # 加载基础模型
-            model_config = ModelConfig(
-                name=self.config.model.base_model_name,
-                device=str(self.device)
-            )
+            print("正在设置SAM LoRA模型...")
             
-            base_model_handler = ModelHandler(model_config)
-            if not base_model_handler.load_model():
-                print("基础模型加载失败")
-                return False
-            
-            # 获取基础模型
-            base_model = base_model_handler.predictor  # 或者适当的模型组件
-            
-            # 创建LoRA模型
+            # 创建LoRA配置
             lora_config = {
                 'rank': self.config.lora.rank,
                 'alpha': self.config.lora.alpha,
                 'dropout': self.config.lora.dropout,
-                'target_modules': self.config.lora.target_modules
+                'target_modules': self.config.lora.target_modules,
+                'apply_lora_to': self.config.model.apply_lora_to,
+                'freeze_image_encoder': self.config.model.freeze_backbone,
+                'freeze_prompt_encoder': self.config.model.freeze_prompt_encoder,
+                'freeze_mask_decoder': self.config.model.freeze_mask_decoder
             }
             
-            self.model = create_lora_model(base_model, lora_config)
-            self.model = self.model.to(self.device)
+            # 创建SAM LoRA模型
+            self.model = create_sam_lora_model(
+                model_type=self.config.model.base_model_name,
+                lora_config=lora_config,
+                device=str(self.device)
+            )
+            
+            if self.model is None:
+                print("SAM LoRA模型创建失败")
+                return False
             
             # 打印模型信息
             self.model.print_model_info()
+            print_model_summary(self.model)
             
             return True
             
         except Exception as e:
             print(f"模型设置失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def setup_data_loaders(self) -> bool:
         """设置数据加载器"""
         try:
+            print("正在创建数据加载器...")
+            
             self.data_loaders = create_data_loaders(
                 config=self.config.data,
                 dataset_type="sam"  # 使用SAM数据集格式
@@ -124,13 +137,20 @@ class LoRATrainer:
             
         except Exception as e:
             print(f"数据加载器设置失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
-    def setup_optimizer(self):
-        """设置优化器和学习率调度器"""
+    def setup_optimizer_and_loss(self):
+        """设置优化器和损失函数"""
         # 只优化LoRA参数
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
+        print(f"可训练参数数量: {len(trainable_params)}")
+        total_trainable = sum(p.numel() for p in trainable_params)
+        print(f"可训练参数总数: {total_trainable:,}")
+        
+        # 创建优化器
         if self.config.training.optimizer.lower() == "adamw":
             self.optimizer = optim.AdamW(
                 trainable_params,
@@ -162,8 +182,19 @@ class LoRATrainer:
         else:
             self.scheduler = None
         
+        # 创建损失函数
+        loss_config = {
+            'focal_loss_weight': 20.0,
+            'dice_loss_weight': 1.0,
+            'iou_loss_weight': 1.0,
+            'use_focal_loss': True,
+            'use_dice_loss': True,
+            'use_iou_loss': True
+        }
+        self.loss_fn = SAMLoss(**loss_config)
+        
         print(f"优化器设置完成: {type(self.optimizer).__name__}")
-        print(f"可训练参数数量: {len(trainable_params)}")
+        print(f"学习率调度器: {type(self.scheduler).__name__ if self.scheduler else 'None'}")
     
     def setup_logging(self):
         """设置日志记录"""
@@ -183,7 +214,9 @@ class LoRATrainer:
     
     def train(self) -> bool:
         """开始训练"""
-        print("开始LoRA训练...")
+        print("="*60)
+        print("开始SAM LoRA训练")
+        print("="*60)
         
         # 设置所有组件
         if not self.setup_model():
@@ -192,16 +225,23 @@ class LoRATrainer:
         if not self.setup_data_loaders():
             return False
         
-        self.setup_optimizer()
+        self.setup_optimizer_and_loss()
         self.setup_logging()
+        
+        # 创建训练步骤函数
+        training_step_fn = create_sam_training_step(
+            self.model, self.optimizer, self.loss_fn, self.device
+        )
         
         # 训练循环
         try:
             for epoch in range(self.config.training.num_epochs):
                 self.current_epoch = epoch
                 
+                print(f"\n开始第 {epoch + 1}/{self.config.training.num_epochs} 轮训练")
+                
                 # 训练一个epoch
-                train_metrics = self.train_epoch()
+                train_metrics = self.train_epoch(training_step_fn)
                 
                 # 验证
                 val_metrics = self.validate() if 'val' in self.data_loaders else {}
@@ -210,7 +250,7 @@ class LoRATrainer:
                 self.log_metrics(train_metrics, val_metrics, epoch)
                 
                 # 保存检查点
-                if (epoch + 1) % (self.config.training.save_steps // len(self.data_loaders['train'])) == 0:
+                if (epoch + 1) % max(1, self.config.training.save_steps // len(self.data_loaders['train'])) == 0:
                     self.save_checkpoint(epoch, val_metrics)
                 
                 # 早停检查
@@ -221,11 +261,16 @@ class LoRATrainer:
                 # 更新学习率
                 if self.scheduler:
                     self.scheduler.step()
+                
+                # 内存优化
+                optimize_memory()
             
             # 保存最终模型
             self.save_final_model()
             
+            print("\n" + "="*60)
             print("训练完成!")
+            print("="*60)
             return True
             
         except Exception as e:
@@ -240,12 +285,11 @@ class LoRATrainer:
             if self.config.experiment.use_wandb:
                 wandb.finish()
     
-    def train_epoch(self) -> Dict[str, float]:
+    def train_epoch(self, training_step_fn) -> Dict[str, float]:
         """训练一个epoch"""
         self.model.train()
         
-        total_loss = 0.0
-        num_batches = 0
+        epoch_metrics = TrainingMetrics()
         
         progress_bar = tqdm(
             self.data_loaders['train'],
@@ -253,162 +297,129 @@ class LoRATrainer:
         )
         
         for batch_idx, batch in enumerate(progress_bar):
-            # 前向传播
-            loss = self.training_step(batch)
-            
-            # 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
-            
-            # 梯度裁剪
-            if self.config.training.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    self.config.training.max_grad_norm
-                )
-            
-            # 优化器步骤
-            self.optimizer.step()
-            
-            # 更新统计
-            total_loss += loss.item()
-            num_batches += 1
-            self.global_step += 1
-            
-            # 更新进度条
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss / num_batches:.4f}',
-                'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
-            })
-            
-            # 记录步骤日志
-            if self.global_step % self.config.training.logging_steps == 0:
-                self.log_step_metrics(loss.item(), batch_idx)
+            try:
+                # 执行训练步骤
+                step_metrics = training_step_fn(batch)
+                
+                # 更新统计
+                if 'error' not in step_metrics:
+                    epoch_metrics.update(step_metrics)
+                    self.global_step += 1
+                    
+                    # 更新进度条
+                    progress_bar.set_postfix({
+                        'loss': f"{step_metrics.get('total_loss', 0):.4f}",
+                        'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                    })
+                    
+                    # 记录步骤日志
+                    if self.global_step % self.config.training.logging_steps == 0:
+                        self.log_step_metrics(step_metrics, batch_idx)
+                else:
+                    print(f"批次 {batch_idx} 处理失败")
+                
+            except Exception as e:
+                print(f"训练步骤失败 (批次 {batch_idx}): {e}")
+                continue
         
-        return {
-            'train_loss': total_loss / num_batches,
-            'learning_rate': self.optimizer.param_groups[0]['lr']
-        }
-    
-    def training_step(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """单个训练步骤"""
-        # 将数据移到设备
-        images = batch['images'].to(self.device)
+        # 计算epoch平均指标
+        avg_metrics = epoch_metrics.compute()
+        avg_metrics['learning_rate'] = self.optimizer.param_groups[0]['lr']
         
-        # 这里需要根据具体的模型架构实现损失计算
-        # 以下是一个简化的示例，实际需要根据SAM的训练方式调整
-        
-        try:
-            # 前向传播（这里需要根据实际的SAM模型接口调整）
-            # 假设模型返回预测结果
-            predictions = self.model(images)
-            
-            # 计算损失（需要根据具体任务调整）
-            loss = self.compute_loss(predictions, batch)
-            
-            return loss
-            
-        except Exception as e:
-            print(f"训练步骤出错: {e}")
-            # 返回一个小的损失值以继续训练
-            return torch.tensor(0.01, requires_grad=True, device=self.device)
-    
-    def compute_loss(self, predictions: Any, batch: Dict[str, Any]) -> torch.Tensor:
-        """计算损失函数"""
-        # 这里需要根据具体的模型输出格式和任务需求实现
-        # 以下是一个简化的示例
-        
-        # 如果有ground truth masks
-        if 'ground_truth_masks' in batch:
-            gt_masks = batch['ground_truth_masks']
-            
-            # 简化的损失计算
-            if hasattr(predictions, 'masks'):
-                pred_masks = predictions.masks
-                # 计算mask损失
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    pred_masks, gt_masks.float().to(self.device)
-                )
-            else:
-                # 如果没有具体的mask输出，使用占位符损失
-                loss = torch.tensor(0.01, requires_grad=True, device=self.device)
-        else:
-            # 占位符损失
-            loss = torch.tensor(0.01, requires_grad=True, device=self.device)
-        
-        return loss
+        return avg_metrics
     
     def validate(self) -> Dict[str, float]:
         """验证模型"""
         if 'val' not in self.data_loaders:
             return {}
         
+        print("正在验证...")
         self.model.eval()
         
-        total_loss = 0.0
-        num_batches = 0
-        all_metrics = []
+        val_metrics = TrainingMetrics()
+        all_predictions = []
+        all_targets = []
         
         with torch.no_grad():
             for batch in tqdm(self.data_loaders['val'], desc="Validating"):
-                # 验证步骤
-                loss = self.validation_step(batch)
-                total_loss += loss.item()
-                num_batches += 1
-                
-                # 计算评测指标
-                metrics = self.compute_validation_metrics(batch)
-                if metrics:
-                    all_metrics.append(metrics)
+                try:
+                    # 准备输入和目标
+                    inputs, targets = prepare_sam_inputs(batch)
+                    
+                    # 将数据移动到设备
+                    for key, value in inputs.items():
+                        if isinstance(value, torch.Tensor):
+                            inputs[key] = value.to(self.device)
+                        elif isinstance(value, list):
+                            inputs[key] = [v.to(self.device) if isinstance(v, torch.Tensor) else v for v in value]
+                    
+                    for key, value in targets.items():
+                        if isinstance(value, torch.Tensor):
+                            targets[key] = value.to(self.device)
+                    
+                    # 前向传播
+                    predictions = self.model(inputs)
+                    
+                    # 计算损失
+                    loss_dict = self.loss_fn(predictions, targets)
+                    val_metrics.update(loss_dict)
+                    
+                    # 收集预测和目标用于指标计算
+                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    target_masks = targets['masks'].cpu().numpy()
+                    
+                    all_predictions.extend(pred_masks)
+                    all_targets.extend(target_masks)
+                    
+                except Exception as e:
+                    print(f"验证步骤失败: {e}")
+                    continue
         
-        # 聚合指标
-        val_metrics = {'val_loss': total_loss / num_batches}
+        # 计算平均损失
+        avg_val_metrics = val_metrics.compute()
         
-        if all_metrics:
-            # 计算平均指标
-            for key in all_metrics[0].keys():
-                values = [m[key] for m in all_metrics if key in m]
-                if values:
-                    val_metrics[f'val_{key}'] = np.mean(values)
+        # 计算分割指标
+        if all_predictions and all_targets:
+            seg_metrics = self._compute_segmentation_metrics(all_predictions[:10], all_targets[:10])  # 限制数量以节省时间
+            avg_val_metrics.update(seg_metrics)
         
-        return val_metrics
+        return avg_val_metrics
     
-    def validation_step(self, batch: Dict[str, Any]) -> torch.Tensor:
-        """单个验证步骤"""
-        images = batch['images'].to(self.device)
-        
+    def _compute_segmentation_metrics(self, predictions: List, targets: List) -> Dict[str, float]:
+        """计算分割指标"""
         try:
-            predictions = self.model(images)
-            loss = self.compute_loss(predictions, batch)
-            return loss
-        except Exception as e:
-            print(f"验证步骤出错: {e}")
-            return torch.tensor(0.01, device=self.device)
-    
-    def compute_validation_metrics(self, batch: Dict[str, Any]) -> Optional[Dict[str, float]]:
-        """计算验证指标"""
-        try:
-            # 这里需要根据具体模型输出实现指标计算
-            # 简化示例
-            if 'ground_truth_masks' in batch and len(batch['ground_truth_masks']) > 0:
-                gt_masks = batch['ground_truth_masks'][0].cpu().numpy()
-                
-                # 生成简单的预测掩码（实际应该使用模型输出）
-                pred_masks = np.random.rand(*gt_masks.shape) > 0.5
-                
-                # 计算指标
-                metrics_result = self.metrics_calculator.compute_all_metrics(
-                    gt_masks, pred_masks.astype(np.int32)
-                )
-                
-                return metrics_result.to_dict()
+            all_ious = []
+            all_dices = []
             
-            return None
+            for pred, target in zip(predictions, targets):
+                if pred.ndim > 2:
+                    pred = pred[0]  # 取第一个通道
+                if target.ndim > 2:
+                    target = target[0]
+                
+                # 二值化
+                pred_binary = (pred > 0.5).astype(np.int32)
+                target_binary = (target > 0.5).astype(np.int32)
+                
+                # 计算IoU和Dice
+                intersection = np.sum(pred_binary * target_binary)
+                union = np.sum(pred_binary) + np.sum(target_binary) - intersection
+                
+                if union > 0:
+                    iou = intersection / union
+                    dice = 2 * intersection / (np.sum(pred_binary) + np.sum(target_binary))
+                    
+                    all_ious.append(iou)
+                    all_dices.append(dice)
+            
+            return {
+                'val_iou': np.mean(all_ious) if all_ious else 0.0,
+                'val_dice': np.mean(all_dices) if all_dices else 0.0
+            }
             
         except Exception as e:
-            print(f"指标计算出错: {e}")
-            return None
+            print(f"分割指标计算失败: {e}")
+            return {'val_iou': 0.0, 'val_dice': 0.0}
     
     def log_metrics(self, train_metrics: Dict[str, float], 
                    val_metrics: Dict[str, float], epoch: int):
@@ -429,7 +440,7 @@ class LoRATrainer:
             wandb.log(log_dict)
         
         # 控制台输出
-        print(f"\nEpoch {epoch + 1}/{self.config.training.num_epochs}")
+        print(f"\nEpoch {epoch + 1}/{self.config.training.num_epochs} - 指标摘要:")
         print("训练指标:")
         for key, value in train_metrics.items():
             print(f"  {key}: {value:.4f}")
@@ -439,13 +450,16 @@ class LoRATrainer:
             for key, value in val_metrics.items():
                 print(f"  {key}: {value:.4f}")
     
-    def log_step_metrics(self, loss: float, step: int):
+    def log_step_metrics(self, step_metrics: Dict[str, float], step: int):
         """记录步骤指标"""
         if self.writer:
-            self.writer.add_scalar('train/step_loss', loss, self.global_step)
+            for key, value in step_metrics.items():
+                self.writer.add_scalar(f'train/step_{key}', value, self.global_step)
         
         if self.config.experiment.use_wandb:
-            wandb.log({'train/step_loss': loss, 'global_step': self.global_step})
+            log_dict = {f'train/step_{k}': v for k, v in step_metrics.items()}
+            log_dict['global_step'] = self.global_step
+            wandb.log(log_dict)
     
     def save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
         """保存检查点"""
@@ -468,24 +482,25 @@ class LoRATrainer:
         torch.save(checkpoint, checkpoint_path)
         
         # 保存最佳模型
-        current_metric = metrics.get('val_loss', float('inf'))
+        current_metric = metrics.get('avg_total_loss', float('inf'))
         if current_metric < self.best_metric:
             self.best_metric = current_metric
             best_path = checkpoint_dir / "best_model.pth"
             torch.save(checkpoint, best_path)
-            print(f"保存最佳模型 (val_loss: {current_metric:.4f})")
+            print(f"保存最佳模型 (loss: {current_metric:.4f})")
         
         # 保存LoRA权重
-        self.model.save_lora_weights(checkpoint_dir / f"lora_epoch_{epoch + 1}")
+        lora_save_path = checkpoint_dir / f"lora_epoch_{epoch + 1}"
+        self.model.save_lora_weights(lora_save_path)
         
         print(f"检查点已保存: {checkpoint_path}")
     
     def check_early_stopping(self, metrics: Dict[str, float]) -> bool:
         """检查早停条件"""
-        if not metrics or 'val_loss' not in metrics:
+        if not metrics or 'avg_total_loss' not in metrics:
             return False
         
-        current_metric = metrics['val_loss']
+        current_metric = metrics['avg_total_loss']
         
         if current_metric < self.best_metric:
             self.early_stopping_counter = 0
@@ -501,8 +516,8 @@ class LoRATrainer:
         self.model.save_lora_weights(final_dir)
         
         # 保存合并后的完整模型
-        merged_path = final_dir / "merged_model.pth"
-        self.model.merge_and_save(merged_path)
+        merged_path = final_dir / "merged_sam_model.pth"
+        self.model.merge_and_save_full_model(merged_path)
         
         # 保存训练摘要
         summary = {
@@ -510,6 +525,12 @@ class LoRATrainer:
             'total_epochs': self.current_epoch + 1,
             'total_steps': self.global_step,
             'best_metric': self.best_metric,
+            'model_type': self.config.model.base_model_name,
+            'lora_config': {
+                'rank': self.config.lora.rank,
+                'alpha': self.config.lora.alpha,
+                'dropout': self.config.lora.dropout
+            },
             'config': self.config.to_dict()
         }
         
@@ -552,31 +573,60 @@ class LoRATrainer:
             return {}
         
         self.model.eval()
-        all_metrics = []
+        test_metrics = TrainingMetrics()
+        all_predictions = []
+        all_targets = []
         
         print("开始模型评估...")
         
         with torch.no_grad():
             for batch in tqdm(test_data_loader, desc="Evaluating"):
-                metrics = self.compute_validation_metrics(batch)
-                if metrics:
-                    all_metrics.append(metrics)
+                try:
+                    # 准备输入和目标
+                    inputs, targets = prepare_sam_inputs(batch)
+                    
+                    # 将数据移动到设备
+                    for key, value in inputs.items():
+                        if isinstance(value, torch.Tensor):
+                            inputs[key] = value.to(self.device)
+                        elif isinstance(value, list):
+                            inputs[key] = [v.to(self.device) if isinstance(v, torch.Tensor) else v for v in value]
+                    
+                    for key, value in targets.items():
+                        if isinstance(value, torch.Tensor):
+                            targets[key] = value.to(self.device)
+                    
+                    # 前向传播
+                    predictions = self.model(inputs)
+                    
+                    # 计算损失
+                    loss_dict = self.loss_fn(predictions, targets)
+                    test_metrics.update(loss_dict)
+                    
+                    # 收集预测和目标
+                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    target_masks = targets['masks'].cpu().numpy()
+                    
+                    all_predictions.extend(pred_masks)
+                    all_targets.extend(target_masks)
+                    
+                except Exception as e:
+                    print(f"评估步骤失败: {e}")
+                    continue
         
-        if not all_metrics:
-            return {}
+        # 计算最终指标
+        final_metrics = test_metrics.compute()
         
-        # 计算平均指标
-        eval_metrics = {}
-        for key in all_metrics[0].keys():
-            values = [m[key] for m in all_metrics if key in m]
-            if values:
-                eval_metrics[key] = np.mean(values)
+        # 计算分割指标
+        if all_predictions and all_targets:
+            seg_metrics = self._compute_segmentation_metrics(all_predictions, all_targets)
+            final_metrics.update(seg_metrics)
         
         print("评估完成:")
-        for key, value in eval_metrics.items():
+        for key, value in final_metrics.items():
             print(f"  {key}: {value:.4f}")
         
-        return eval_metrics
+        return final_metrics
 
 
 def create_trainer_from_config(config_path: str) -> LoRATrainer:
@@ -593,7 +643,12 @@ def resume_training(checkpoint_path: str, config_path: Optional[str] = None) -> 
         # 从检查点目录加载配置
         checkpoint_dir = Path(checkpoint_path).parent
         config_file = checkpoint_dir.parent / "config.json"
-        trainer = create_trainer_from_config(str(config_file))
+        if config_file.exists():
+            trainer = create_trainer_from_config(str(config_file))
+        else:
+            print("无法找到配置文件，使用默认配置")
+            from config.lora_config import LoRATrainingSettings
+            trainer = LoRATrainer(LoRATrainingSettings())
     
     trainer.load_checkpoint(checkpoint_path)
     return trainer

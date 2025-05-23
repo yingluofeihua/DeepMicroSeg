@@ -1,6 +1,7 @@
 """
-LoRA训练数据加载器
+LoRA训练数据加载器 (修复版)
 支持细胞分割任务的数据加载和预处理
+兼容core/dataset_manager.py的数据结构
 """
 
 import torch
@@ -18,10 +19,11 @@ import json
 
 from config.lora_config import DataConfig
 from utils.file_utils import load_image, load_mask
+from config.paths import DatasetPathValidator
 
 
 class CellSegmentationDataset(Dataset):
-    """细胞分割数据集"""
+    """细胞分割数据集 - 支持层次化数据结构"""
     
     def __init__(
         self,
@@ -45,111 +47,102 @@ class CellSegmentationDataset(Dataset):
         print(f"加载了 {len(self.samples)} 个{split}样本")
     
     def _load_samples(self) -> List[Dict]:
-        """加载数据样本"""
+        """加载数据样本 - 使用与dataset_manager相同的逻辑"""
         samples = []
         
-        # 检查数据目录结构
-        if self._is_standard_structure():
-            samples = self._load_standard_structure()
-        elif self._is_mapping_structure():
-            samples = self._load_mapping_structure()
-        else:
-            samples = self._load_flat_structure()
-        
-        # 过滤无效样本
-        valid_samples = []
-        for sample in samples:
-            if self._validate_sample(sample):
-                valid_samples.append(sample)
-        
-        return valid_samples
-    
-    def _is_standard_structure(self) -> bool:
-        """检查是否为标准结构 (images/ 和 masks/ 文件夹)"""
-        return (self.data_dir / "images").exists() and (self.data_dir / "masks").exists()
-    
-    def _is_mapping_structure(self) -> bool:
-        """检查是否为映射结构 (有mapping.json文件)"""
-        return (self.data_dir / "mapping.json").exists()
-    
-    def _load_standard_structure(self) -> List[Dict]:
-        """加载标准结构数据"""
-        samples = []
-        images_dir = self.data_dir / "images"
-        masks_dir = self.data_dir / "masks"
-        
-        for img_file in images_dir.glob("*"):
-            if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tif', '.tiff']:
-                # 查找对应的掩码
-                mask_patterns = [
-                    masks_dir / f"{img_file.stem}_seg.png",
-                    masks_dir / f"{img_file.stem}.png",
-                    masks_dir / f"{img_file.stem}_mask.png",
-                    masks_dir / f"{img_file.stem}.tif"
-                ]
-                
-                for mask_path in mask_patterns:
-                    if mask_path.exists():
-                        samples.append({
-                            'image_path': str(img_file),
-                            'mask_path': str(mask_path),
-                            'sample_id': img_file.stem
-                        })
-                        break
-        
-        return samples
-    
-    def _load_mapping_structure(self) -> List[Dict]:
-        """加载映射结构数据"""
-        samples = []
-        mapping_file = self.data_dir / "mapping.json"
-        
-        with open(mapping_file, 'r') as f:
-            mapping_data = json.load(f)
-        
-        images_dir = Path(mapping_data.get('images_path', self.data_dir / "images"))
-        masks_dir = Path(mapping_data.get('masks_path', self.data_dir / "masks"))
-        
-        for img_name, info in mapping_data.get('mapping', {}).items():
-            img_path = images_dir / img_name
-            mask_path = masks_dir / info['mask_file']
+        try:
+            # 使用DatasetPathValidator来验证和发现数据集
+            valid_datasets = DatasetPathValidator.validate_dataset_structure(self.data_dir)
             
-            if img_path.exists() and mask_path.exists():
-                samples.append({
-                    'image_path': str(img_path),
-                    'mask_path': str(mask_path),
-                    'sample_id': Path(img_name).stem
-                })
-        
-        return samples
-    
-    def _load_flat_structure(self) -> List[Dict]:
-        """加载平铺结构数据"""
-        samples = []
-        
-        # 假设图像和掩码在同一目录下，通过文件名区分
-        image_files = []
-        mask_files = []
-        
-        for file_path in self.data_dir.glob("*"):
-            if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tif', '.tiff']:
-                if any(keyword in file_path.name.lower() for keyword in ['mask', 'seg', 'label']):
-                    mask_files.append(file_path)
-                else:
-                    image_files.append(file_path)
-        
-        # 匹配图像和掩码
-        for img_file in image_files:
-            for mask_file in mask_files:
-                if img_file.stem in mask_file.name:
+            print(f"发现 {len(valid_datasets)} 个有效数据集")
+            
+            for dataset_info in valid_datasets:
+                images_dir = Path(dataset_info['images_dir'])
+                masks_dir = Path(dataset_info['masks_dir'])
+                
+                # 获取图像-掩码对
+                image_mask_pairs = self._get_image_mask_pairs(images_dir, masks_dir)
+                
+                for img_path, mask_path in image_mask_pairs:
                     samples.append({
-                        'image_path': str(img_file),
-                        'mask_path': str(mask_file),
-                        'sample_id': img_file.stem
+                        'image_path': str(img_path),
+                        'mask_path': str(mask_path),
+                        'sample_id': img_path.stem,
+                        'cell_type': dataset_info['cell_type'],
+                        'date': dataset_info['date'],
+                        'magnification': dataset_info['magnification'],
+                        'dataset_id': dataset_info['dataset_id']
                     })
-                    break
+            
+            # 数据集分割
+            samples = self._split_samples(samples)
+            
+            # 过滤无效样本
+            valid_samples = []
+            for sample in samples:
+                if self._validate_sample(sample):
+                    valid_samples.append(sample)
+            
+            return valid_samples
+            
+        except Exception as e:
+            print(f"加载数据样本失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def _get_image_mask_pairs(self, images_dir: Path, masks_dir: Path) -> List[Tuple[Path, Path]]:
+        """获取图像-掩码对"""
+        pairs = []
         
-        return samples
+        # 获取所有图像文件
+        image_files = []
+        for ext in ['.jpg', '.jpeg', '.png', '.tif', '.tiff']:
+            image_files.extend(list(images_dir.glob(f"*{ext}")))
+            image_files.extend(list(images_dir.glob(f"*{ext.upper()}")))
+        
+        # 为每个图像文件查找对应的掩码
+        for img_file in image_files:
+            mask_file = DatasetPathValidator.find_matching_mask(img_file, masks_dir)
+            if mask_file:
+                pairs.append((img_file, mask_file))
+        
+        return pairs
+    
+    def _split_samples(self, samples: List[Dict]) -> List[Dict]:
+        """根据split参数分割数据"""
+        if not samples:
+            return []
+        
+        # 按数据集分组
+        dataset_groups = {}
+        for sample in samples:
+            dataset_id = sample['dataset_id']
+            if dataset_id not in dataset_groups:
+                dataset_groups[dataset_id] = []
+            dataset_groups[dataset_id].append(sample)
+        
+        # 为每个数据集进行分割
+        split_samples = []
+        for dataset_id, dataset_samples in dataset_groups.items():
+            n_total = len(dataset_samples)
+            n_train = int(n_total * self.config.train_split_ratio)
+            n_val = int(n_total * self.config.val_split_ratio)
+            
+            # 随机打乱（使用固定种子确保可重现）
+            random.seed(42)
+            random.shuffle(dataset_samples)
+            
+            if self.split == "train":
+                split_samples.extend(dataset_samples[:n_train])
+            elif self.split == "val":
+                split_samples.extend(dataset_samples[n_train:n_train + n_val])
+            elif self.split == "test":
+                split_samples.extend(dataset_samples[n_train + n_val:])
+            else:  # "all"
+                split_samples.extend(dataset_samples)
+        
+        return split_samples
     
     def _validate_sample(self, sample: Dict) -> bool:
         """验证样本有效性"""
@@ -206,16 +199,16 @@ class CellSegmentationDataset(Dataset):
                 ], p=0.3),
                 A.OneOf([
                     A.GaussianBlur(blur_limit=3, p=0.3),
-                    A.GaussNoise(var_limit=(0, 0.1), p=0.3),
+                    A.GaussNoise(p=0.3),  # 移除var_limit参数
                 ], p=0.2),
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                A.Normalize(mean=self.config.normalize_mean, std=self.config.normalize_std),
                 ToTensorV2()
             ])
         else:
             # 验证/测试时只做基本变换
             transform = A.Compose([
                 A.Resize(self.config.image_size[0], self.config.image_size[1]),
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                A.Normalize(mean=self.config.normalize_mean, std=self.config.normalize_std),
                 ToTensorV2()
             ])
         
@@ -261,7 +254,11 @@ class CellSegmentationDataset(Dataset):
             'masks': instance_masks,
             'boxes': boxes,
             'labels': torch.ones(len(boxes), dtype=torch.long),  # 所有对象都是细胞
-            'sample_id': sample['sample_id']
+            'sample_id': sample['sample_id'],
+            'cell_type': sample['cell_type'],
+            'date': sample['date'],
+            'magnification': sample['magnification'],
+            'dataset_id': sample['dataset_id']
         }
     
     def _get_empty_sample(self) -> Dict[str, torch.Tensor]:
@@ -272,7 +269,11 @@ class CellSegmentationDataset(Dataset):
             'masks': torch.zeros(0, h, w),
             'boxes': torch.zeros(0, 4),
             'labels': torch.zeros(0, dtype=torch.long),
-            'sample_id': 'empty'
+            'sample_id': 'empty',
+            'cell_type': 'unknown',
+            'date': 'unknown',
+            'magnification': 'unknown',
+            'dataset_id': 'unknown'
         }
     
     def _process_mask(self, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -349,7 +350,11 @@ class SAMDataset(CellSegmentationDataset):
                 'mask_inputs': None,  # 可以为None
                 'multimask_output': False,
                 'ground_truth_masks': masks,
-                'sample_id': sample['sample_id']
+                'sample_id': sample['sample_id'],
+                'cell_type': sample['cell_type'],
+                'date': sample['date'],
+                'magnification': sample['magnification'],
+                'dataset_id': sample['dataset_id']
             }
         else:
             # 没有对象的情况
@@ -362,7 +367,11 @@ class SAMDataset(CellSegmentationDataset):
                 'mask_inputs': None,
                 'multimask_output': False,
                 'ground_truth_masks': torch.zeros(0, h, w),
-                'sample_id': sample['sample_id']
+                'sample_id': sample['sample_id'],
+                'cell_type': sample['cell_type'],
+                'date': sample['date'],
+                'magnification': sample['magnification'],
+                'dataset_id': sample['dataset_id']
             }
     
     def _generate_point_prompts(self, masks: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -434,15 +443,18 @@ def create_data_loaders(config: DataConfig, dataset_type: str = "standard") -> D
             split='train'
         )
         
-        data_loaders['train'] = DataLoader(
-            datasets['train'],
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor,
-            collate_fn=collate_fn
-        )
+        if len(datasets['train']) > 0:
+            data_loaders['train'] = DataLoader(
+                datasets['train'],
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=config.num_workers,
+                pin_memory=config.pin_memory,
+                prefetch_factor=config.prefetch_factor,
+                collate_fn=collate_fn
+            )
+        else:
+            print("警告: 训练集为空，跳过创建训练数据加载器")
     
     # 验证集
     if config.val_data_dir:
@@ -452,14 +464,32 @@ def create_data_loaders(config: DataConfig, dataset_type: str = "standard") -> D
             split='val'
         )
         
-        data_loaders['val'] = DataLoader(
-            datasets['val'],
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            collate_fn=collate_fn
+        if len(datasets['val']) > 0:
+            data_loaders['val'] = DataLoader(
+                datasets['val'],
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers,
+                pin_memory=config.pin_memory,
+                collate_fn=collate_fn
+            )
+    elif config.train_data_dir and len(datasets['train']) > 0:
+        # 如果没有指定验证集，从训练数据中创建
+        datasets['val'] = dataset_class(
+            data_dir=config.train_data_dir,
+            config=config,
+            split='val'
         )
+        
+        if len(datasets['val']) > 0:
+            data_loaders['val'] = DataLoader(
+                datasets['val'],
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers,
+                pin_memory=config.pin_memory,
+                collate_fn=collate_fn
+            )
     
     # 测试集
     if config.test_data_dir:
@@ -469,14 +499,15 @@ def create_data_loaders(config: DataConfig, dataset_type: str = "standard") -> D
             split='test'
         )
         
-        data_loaders['test'] = DataLoader(
-            datasets['test'],
-            batch_size=1,  # 测试时batch_size=1
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            collate_fn=collate_fn
-        )
+        if len(datasets['test']) > 0:
+            data_loaders['test'] = DataLoader(
+                datasets['test'],
+                batch_size=1,  # 测试时batch_size=1
+                shuffle=False,
+                num_workers=config.num_workers,
+                pin_memory=config.pin_memory,
+                collate_fn=collate_fn
+            )
     
     return data_loaders
 
@@ -526,39 +557,28 @@ def collate_fn(batch):
 
 def split_dataset(data_dir: str, train_ratio: float = 0.8, val_ratio: float = 0.1):
     """将数据集分割为训练/验证/测试集"""
-    data_path = Path(data_dir)
+    print(f"数据分割功能已整合到数据集类中")
+    print(f"训练/验证/测试比例: {train_ratio}/{val_ratio}/{1-train_ratio-val_ratio}")
+    print(f"数据目录: {data_dir}")
     
-    # 获取所有样本
-    dataset = CellSegmentationDataset(data_dir, DataConfig(), split='all')
-    samples = dataset.samples
+    # 创建一个临时数据集来验证数据结构
+    from config.lora_config import DataConfig
+    config = DataConfig()
+    config.train_split_ratio = train_ratio
+    config.val_split_ratio = val_ratio
     
-    # 随机打乱
-    random.shuffle(samples)
-    
-    # 计算分割点
-    n_total = len(samples)
-    n_train = int(n_total * train_ratio)
-    n_val = int(n_total * val_ratio)
-    
-    # 分割数据
-    train_samples = samples[:n_train]
-    val_samples = samples[n_train:n_train + n_val]
-    test_samples = samples[n_train + n_val:]
-    
-    # 创建分割目录
-    for split_name, split_samples in [
-        ('train', train_samples),
-        ('val', val_samples), 
-        ('test', test_samples)
-    ]:
-        split_dir = data_path / split_name
-        split_dir.mkdir(exist_ok=True)
+    try:
+        # 测试数据加载
+        train_dataset = CellSegmentationDataset(data_dir, config, split='train')
+        val_dataset = CellSegmentationDataset(data_dir, config, split='val')
+        test_dataset = CellSegmentationDataset(data_dir, config, split='test')
         
-        # 保存样本列表
-        with open(split_dir / 'samples.json', 'w') as f:
-            json.dump(split_samples, f, indent=2)
-    
-    print(f"数据集分割完成:")
-    print(f"  训练集: {len(train_samples)} 样本")
-    print(f"  验证集: {len(val_samples)} 样本") 
-    print(f"  测试集: {len(test_samples)} 样本")
+        print(f"数据分割结果:")
+        print(f"  训练集: {len(train_dataset)} 样本")
+        print(f"  验证集: {len(val_dataset)} 样本")
+        print(f"  测试集: {len(test_dataset)} 样本")
+        
+    except Exception as e:
+        print(f"数据分割测试失败: {e}")
+        import traceback
+        traceback.print_exc()

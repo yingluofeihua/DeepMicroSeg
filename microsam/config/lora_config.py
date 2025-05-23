@@ -1,5 +1,5 @@
 """
-LoRA微调配置管理模块
+LoRA微调配置管理模块 (修复版)
 """
 
 from dataclasses import dataclass, field
@@ -25,9 +25,8 @@ class LoRAConfig:
         if self.target_modules is None:
             # 默认目标模块（针对Vision Transformer）
             self.target_modules = [
-                "query", "value", "key", "dense",
-                "attention.query", "attention.value", 
-                "attention.key", "attention.dense"
+                "qkv", "proj", "fc1", "fc2", "mlp.lin1", "mlp.lin2",
+                "attention.qkv", "attention.proj", "mlp"
             ]
 
 
@@ -70,7 +69,7 @@ class TrainingConfig:
 
 @dataclass
 class DataConfig:
-    """数据配置"""
+    """数据配置 (修复版)"""
     
     # 数据路径
     train_data_dir: str = ""
@@ -78,12 +77,13 @@ class DataConfig:
     test_data_dir: str = ""
     
     # 数据处理
-    image_size: tuple = (512, 512)
+    image_size: tuple = (1024, 1024)  # SAM默认输入尺寸
     max_objects_per_image: int = 100
     train_split_ratio: float = 0.8
     val_split_ratio: float = 0.1
     
     # 数据加载
+    batch_size: int = 8  # 添加批大小
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
@@ -92,6 +92,19 @@ class DataConfig:
     min_object_size: int = 10
     max_object_size: Optional[int] = None
     filter_empty_images: bool = True
+    
+    # 数据增强 - 添加缺少的属性
+    use_data_augmentation: bool = True
+    augmentation_probability: float = 0.5
+    horizontal_flip_prob: float = 0.5
+    vertical_flip_prob: float = 0.5
+    rotation_prob: float = 0.3
+    brightness_contrast_prob: float = 0.3
+    noise_prob: float = 0.2
+    
+    # 归一化参数
+    normalize_mean: List[float] = field(default_factory=lambda: [0.485, 0.456, 0.406])
+    normalize_std: List[float] = field(default_factory=lambda: [0.229, 0.224, 0.225])
 
 
 @dataclass
@@ -166,6 +179,10 @@ class LoRATrainingSettings:
         Path(self.experiment.output_dir).mkdir(parents=True, exist_ok=True)
         Path(self.experiment.logging_dir).mkdir(parents=True, exist_ok=True)
         Path(self.experiment.cache_dir).mkdir(parents=True, exist_ok=True)
+        
+        # 同步批大小设置
+        if hasattr(self.training, 'batch_size'):
+            self.data.batch_size = self.training.batch_size
     
     def to_dict(self) -> Dict:
         """转换为字典"""
@@ -314,7 +331,10 @@ LORA_PRESET_CONFIGS = {
 
 def get_config_for_model(model_name: str) -> LoRATrainingSettings:
     """为特定模型获取推荐配置"""
-    base_config = LORA_PRESET_CONFIGS["standard"]
+    base_config = LORA_PRESET_CONFIGS["standard"].copy() if hasattr(LORA_PRESET_CONFIGS["standard"], 'copy') else LoRATrainingSettings()
+    
+    # 重新创建配置以避免引用问题
+    base_config = LoRATrainingSettings()
     
     if model_name == "vit_t_lm":
         # 小模型可以用更高的学习率和更大的batch size
@@ -324,7 +344,9 @@ def get_config_for_model(model_name: str) -> LoRATrainingSettings:
         
     elif model_name == "vit_b_lm":
         # 中等模型使用标准配置
-        pass
+        base_config.training.learning_rate = 1e-4
+        base_config.training.batch_size = 8
+        base_config.lora.rank = 8
         
     elif model_name == "vit_l_lm":
         # 大模型需要更小的学习率和batch size

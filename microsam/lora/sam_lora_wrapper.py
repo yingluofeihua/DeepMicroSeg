@@ -201,15 +201,12 @@ class SAMLoRAWrapper(nn.Module):
             images = batch_inputs['images']  # [B, C, H, W]
             device = images.device
             
-            print(f"DEBUG: images device: {device}, shape: {images.shape}")
-            
             # 🔧 确保所有模型组件都在正确设备上
             self._ensure_models_on_device(device)
             
             # 图像编码
             try:
                 image_embeddings = self.image_encoder(images)
-                print(f"DEBUG: image_embeddings shape: {image_embeddings.shape}, device: {image_embeddings.device}")
             except Exception as e:
                 print(f"图像编码失败: {e}")
                 raise
@@ -278,7 +275,6 @@ class SAMLoRAWrapper(nn.Module):
             
             # 合并批量输出
             result = self._merge_batch_outputs(batch_outputs)
-            print(f"DEBUG: forward result shapes - masks: {result['masks'].shape}, iou: {result['iou_predictions'].shape}")
             
             return result
             
@@ -313,8 +309,6 @@ class SAMLoRAWrapper(nn.Module):
             if hasattr(lora_module, 'lora'):
                 lora_module.lora = lora_module.lora.to(device)
             lora_module = lora_module.to(device)
-        
-        print(f"DEBUG: 所有模型组件已移动到设备: {device}")
 
     def _encode_prompts(self, point_coords, point_labels, boxes, mask_inputs, batch_idx, device):
         """编码提示信息 - 确保设备一致性"""

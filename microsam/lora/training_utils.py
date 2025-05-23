@@ -1,6 +1,6 @@
 """
-LoRA训练工具函数
-包含SAM训练的损失函数、数据预处理等工具
+LoRA训练工具函数 - 修复版
+修复SAM训练中的掩码形状不匹配问题
 """
 
 import torch
@@ -37,17 +37,24 @@ class SAMLoss(nn.Module):
     
     def forward(self, predictions: Dict[str, torch.Tensor], 
                 targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """计算总损失"""
-        pred_masks = predictions['masks']  # [B, N, H, W]
-        target_masks = targets['masks']    # [B, N, H, W]
+        """计算总损失 - 修复多实例掩码处理"""
+        pred_masks = predictions['masks']  # [B, 1, H, W] - SAM输出单个掩码
+        target_masks = targets['masks']    # [B, N, H, W] - 多个实例掩码
         
-        # 确保尺寸匹配
-        if pred_masks.shape != target_masks.shape:
-            target_masks = F.interpolate(
-                target_masks.float(), 
+        # 🔧 关键修复：将多实例目标掩码合并为单个二进制掩码
+        if target_masks.shape[1] > 1:
+            # 将所有实例掩码合并为一个二进制掩码 [B, N, H, W] -> [B, 1, H, W]
+            combined_target = (target_masks.sum(dim=1, keepdim=True) > 0).float()
+        else:
+            combined_target = target_masks.float()
+        
+        # 确保预测和目标形状匹配
+        if pred_masks.shape != combined_target.shape:
+            # 如果空间尺寸不匹配，调整目标掩码尺寸
+            combined_target = F.interpolate(
+                combined_target, 
                 size=pred_masks.shape[-2:], 
-                mode='bilinear', 
-                align_corners=False
+                mode='nearest'
             )
         
         loss_dict = {}
@@ -55,19 +62,19 @@ class SAMLoss(nn.Module):
         
         # Focal Loss
         if self.use_focal_loss:
-            focal_loss = self._focal_loss(pred_masks, target_masks)
+            focal_loss = self._focal_loss(pred_masks, combined_target)
             loss_dict['focal_loss'] = focal_loss
             total_loss += self.focal_loss_weight * focal_loss
         
         # Dice Loss
         if self.use_dice_loss:
-            dice_loss = self._dice_loss(pred_masks, target_masks)
+            dice_loss = self._dice_loss(pred_masks, combined_target)
             loss_dict['dice_loss'] = dice_loss
             total_loss += self.dice_loss_weight * dice_loss
         
         # IoU Loss
         if self.use_iou_loss:
-            iou_loss = self._iou_loss(pred_masks, target_masks)
+            iou_loss = self._iou_loss(pred_masks, combined_target)
             loss_dict['iou_loss'] = iou_loss
             total_loss += self.iou_loss_weight * iou_loss
         
@@ -90,7 +97,7 @@ class SAMLoss(nn.Module):
         
         # 计算focal loss
         ce_loss = F.binary_cross_entropy_with_logits(
-            pred_masks, target_masks.float(), reduction='none'
+            pred_masks, target_masks, reduction='none'
         )
         
         p_t = pred_sigmoid * target_masks + (1 - pred_sigmoid) * (1 - target_masks)
@@ -132,23 +139,8 @@ class SAMLoss(nn.Module):
         return iou_loss.mean()
 
 
-def calculate_sam_loss(predictions: Dict[str, torch.Tensor], 
-                      ground_truth: Dict[str, torch.Tensor],
-                      loss_config: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
-    """计算SAM损失的便捷函数"""
-    if loss_config is None:
-        loss_config = {
-            'focal_loss_weight': 20.0,
-            'dice_loss_weight': 1.0,
-            'iou_loss_weight': 1.0
-        }
-    
-    loss_fn = SAMLoss(**loss_config)
-    return loss_fn(predictions, ground_truth)
-
-
 def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
-    """准备SAM训练的输入和目标 - 处理张量掩码"""
+    """准备SAM训练的输入和目标 - 修复多实例掩码处理"""
     
     try:
         # 输入数据
@@ -161,23 +153,24 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
             'multimask_output': batch.get('multimask_output', False)
         }
         
-        # 目标数据 - 现在应该是张量
+        # 目标数据
         ground_truth_masks = batch['ground_truth_masks']  # [B, N, H, W]
-        
-        print(f"DEBUG: ground_truth_masks type: {type(ground_truth_masks)}")
-        print(f"DEBUG: ground_truth_masks shape: {ground_truth_masks.shape}")
         
         # 确保在正确设备上
         device = inputs['images'].device
         
         if isinstance(ground_truth_masks, torch.Tensor):
-            # 现在是张量，直接使用
             targets_masks = ground_truth_masks.to(device)
-            print(f"DEBUG: 使用张量掩码，形状: {targets_masks.shape}")
+            
+            # 🔧 关键修复：处理多实例掩码
+            if targets_masks.shape[1] > 1:
+                # 方案1：合并所有实例为单个二进制掩码
+                binary_masks = (targets_masks.sum(dim=1, keepdim=True) > 0).float()
+                targets_masks = binary_masks
             
         else:
-            # 如果还是列表（向后兼容），转换为张量
-            print(f"WARNING: ground_truth_masks still is list, converting to tensor")
+            # 向后兼容处理
+            print(f"WARNING: ground_truth_masks还是列表格式，转换为张量")
             
             if isinstance(ground_truth_masks, list):
                 processed_masks = []
@@ -187,32 +180,29 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                         masks = masks.to(device)
                         if len(masks.shape) == 2:
                             masks = masks.unsqueeze(0)
-                        processed_masks.append(masks)
+                        
+                        # 如果有多个实例，合并为二进制掩码
+                        if masks.shape[0] > 1:
+                            binary_mask = (masks.sum(dim=0, keepdim=True) > 0).float()
+                            processed_masks.append(binary_mask)
+                        else:
+                            processed_masks.append(masks)
                     else:
                         h, w = inputs['images'].shape[-2:]
-                        default_mask = torch.zeros(1, h, w, dtype=torch.long, device=device)
+                        default_mask = torch.zeros(1, h, w, dtype=torch.float32, device=device)
                         processed_masks.append(default_mask)
                 
                 # 统一形状并堆叠
-                max_objects = max([mask.shape[0] for mask in processed_masks])
                 target_size = processed_masks[0].shape[-2:]
-                
                 unified_masks = []
+                
                 for masks in processed_masks:
                     if masks.shape[-2:] != target_size:
                         masks = torch.nn.functional.interpolate(
                             masks.unsqueeze(1).float(),
                             size=target_size,
                             mode='nearest'
-                        ).squeeze(1).long()
-                    
-                    if masks.shape[0] < max_objects:
-                        padding_shape = (max_objects - masks.shape[0], target_size[0], target_size[1])
-                        padding = torch.zeros(padding_shape, dtype=torch.long, device=device)
-                        masks = torch.cat([masks, padding], dim=0)
-                    elif masks.shape[0] > max_objects:
-                        masks = masks[:max_objects]
-                    
+                        ).squeeze(1)
                     unified_masks.append(masks)
                 
                 targets_masks = torch.stack(unified_masks)
@@ -220,10 +210,10 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 # 创建默认张量
                 batch_size = inputs['images'].shape[0]
                 h, w = inputs['images'].shape[-2:]
-                targets_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.long, device=device)
+                targets_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.float32, device=device)
         
         targets = {
-            'masks': targets_masks  # [B, N, H, W]
+            'masks': targets_masks  # [B, 1, H, W] - 现在是单个二进制掩码
         }
         
         # 计算IoU目标
@@ -234,8 +224,6 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         except Exception as e:
             print(f"WARNING: IoU targets calculation failed: {e}")
             targets['iou_targets'] = torch.ones(targets_masks.shape[0], targets_masks.shape[1], device=device)
-        
-        print(f"DEBUG: prepare_sam_inputs successful, targets_masks shape: {targets_masks.shape}")
         return inputs, targets
         
     except Exception as e:
@@ -258,11 +246,12 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         }
         
         targets = {
-            'masks': torch.zeros(batch_size, 1, h, w, dtype=torch.long, device=device),
+            'masks': torch.zeros(batch_size, 1, h, w, dtype=torch.float32, device=device),
             'iou_targets': torch.ones(batch_size, 1, device=device)
         }
         
         return inputs, targets
+
 
 def calculate_mask_iou_targets(masks: torch.Tensor) -> torch.Tensor:
     """计算掩码的IoU目标值"""
@@ -428,10 +417,16 @@ class TrainingMetrics:
     
     def update(self, loss_dict: Dict[str, torch.Tensor]):
         """更新指标"""
-        self.total_loss += loss_dict.get('total_loss', 0.0).item()
-        self.focal_loss += loss_dict.get('focal_loss', 0.0).item()
-        self.dice_loss += loss_dict.get('dice_loss', 0.0).item()
-        self.iou_loss += loss_dict.get('iou_loss', 0.0).item()
+        def safe_item(value):
+            """安全地获取数值，处理tensor和float"""
+            if isinstance(value, torch.Tensor):
+                return value.item()
+            return float(value)
+        
+        self.total_loss += safe_item(loss_dict.get('total_loss', 0.0))
+        self.focal_loss += safe_item(loss_dict.get('focal_loss', 0.0))
+        self.dice_loss += safe_item(loss_dict.get('dice_loss', 0.0))
+        self.iou_loss += safe_item(loss_dict.get('iou_loss', 0.0))
         self.count += 1
     
     def compute(self) -> Dict[str, float]:
@@ -460,11 +455,6 @@ def validate_sam_batch(batch: Dict[str, Any]) -> bool:
     images = batch['images']
     masks = batch['ground_truth_masks']
     
-    print("images.shape: ", images.shape)
-    print("images.type: ", type(images))
-    print("masks.shape: ", masks.shape)  # 现在应该是张量
-    print("masks.type: ", type(masks))
-    
     # 检查图像张量
     if not isinstance(images, torch.Tensor):
         print(f"images不是张量: {type(images)}")
@@ -488,12 +478,6 @@ def validate_sam_batch(batch: Dict[str, Any]) -> bool:
         print(f"批次大小不匹配: 图像 {images.shape[0]} vs 掩码 {masks.shape[0]}")
         return False
     
-    # 检查空间尺寸匹配（可选，因为SAM可能会resize）
-    # if images.shape[-2:] != masks.shape[-2:]:
-    #     print(f"空间尺寸不匹配: 图像 {images.shape[-2:]} vs 掩码 {masks.shape[-2:]}")
-    #     return False
-    
-    print(f"✅ 批次验证通过：图像 {images.shape}, 掩码 {masks.shape}")
     return True
 
 
@@ -534,7 +518,27 @@ def create_sam_training_step(model, optimizer, loss_fn, device):
         optimizer.step()
         
         # 返回损失信息
-        return {key: value.item() if isinstance(value, torch.Tensor) else value 
-                for key, value in loss_dict.items()}
+        def safe_item(value):
+            """安全地获取数值"""
+            if isinstance(value, torch.Tensor):
+                return value.item()
+            return float(value)
+        
+        return {key: safe_item(value) for key, value in loss_dict.items()}
     
     return training_step
+
+
+def calculate_sam_loss(predictions: Dict[str, torch.Tensor], 
+                      ground_truth: Dict[str, torch.Tensor],
+                      loss_config: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
+    """计算SAM损失的便捷函数"""
+    if loss_config is None:
+        loss_config = {
+            'focal_loss_weight': 20.0,
+            'dice_loss_weight': 1.0,
+            'iou_loss_weight': 1.0
+        }
+    
+    loss_fn = SAMLoss(**loss_config)
+    return loss_fn(predictions, ground_truth)

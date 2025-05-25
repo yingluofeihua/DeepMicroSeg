@@ -140,9 +140,9 @@ class ExperimentConfig:
     tags: List[str] = field(default_factory=list)
     
     # 输出路径
-    output_dir: str = "./lora_experiments"
-    logging_dir: str = "./logs"
-    cache_dir: str = "./cache"
+    output_dir: str = "./data/patch/lora_experiments"
+    logging_dir: str = "./data/patch/logs"
+    cache_dir: str = "./data/patch/cache"
     
     # 实验追踪
     use_wandb: bool = False

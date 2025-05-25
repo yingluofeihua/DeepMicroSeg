@@ -379,7 +379,7 @@ class LoRATrainer:
         return avg_metrics
     
     def validate(self) -> Dict[str, float]:
-        """验证模型"""
+        """验证模型 - 修复尺寸不匹配"""
         if 'val' not in self.data_loaders:
             return {}
         
@@ -391,7 +391,7 @@ class LoRATrainer:
         all_targets = []
         
         with torch.no_grad():
-            for batch in tqdm(self.data_loaders['val'], desc="Validating"):
+            for batch_idx, batch in enumerate(tqdm(self.data_loaders['val'], desc="Validating")):
                 try:
                     # 准备输入和目标
                     inputs, targets = prepare_sam_inputs(batch)
@@ -414,13 +414,31 @@ class LoRATrainer:
                     loss_dict = self.loss_fn(predictions, targets)
                     val_metrics.update(loss_dict)
                     
-                    # 收集预测和目标用于指标计算
-                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
-                    target_masks = targets['masks'].cpu().numpy()
+                    # 🔧 修复：收集原始尺寸的预测和目标用于指标计算
+                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()  # [B, 1, 256, 256]
                     
-                    all_predictions.extend(pred_masks)
-                    all_targets.extend(target_masks)
+                    # 获取原始尺寸的目标掩码
+                    original_targets = batch['ground_truth_masks'].cpu().numpy()  # [B, N, 1024, 1024]
                     
+                    # 合并多实例目标为二进制掩码
+                    if original_targets.shape[1] > 1:
+                        # 将多实例合并为二进制掩码
+                        target_masks = (original_targets.sum(axis=1, keepdims=True) > 0).astype(np.float32)
+                    else:
+                        target_masks = original_targets
+                    
+                    # 移除批次维度并添加到列表
+                    for i in range(pred_masks.shape[0]):
+                        pred_mask = pred_masks[i]  # [1, 256, 256]
+                        target_mask = target_masks[i]  # [1, 1024, 1024]
+                        
+                        all_predictions.append(pred_mask)
+                        all_targets.append(target_mask)
+                    
+                    # 只处理前几个批次用于验证（避免内存问题）
+                    if batch_idx >= 5:  # 限制验证数量
+                        break
+                        
                 except Exception as e:
                     print(f"验证步骤失败: {e}")
                     continue
@@ -430,22 +448,47 @@ class LoRATrainer:
         
         # 计算分割指标
         if all_predictions and all_targets:
-            seg_metrics = self._compute_segmentation_metrics(all_predictions[:10], all_targets[:10])  # 限制数量以节省时间
+            print(f"DEBUG: 计算分割指标，预测数量={len(all_predictions)}, 目标数量={len(all_targets)}")
+            seg_metrics = self._compute_segmentation_metrics(all_predictions, all_targets)
             avg_val_metrics.update(seg_metrics)
+        else:
+            print("DEBUG: 没有有效的预测/目标数据")
+            avg_val_metrics.update({'val_iou': 0.0, 'val_dice': 0.0})
         
         return avg_val_metrics
     
     def _compute_segmentation_metrics(self, predictions: List, targets: List) -> Dict[str, float]:
-        """计算分割指标"""
+        """计算分割指标 - 修复尺寸不匹配问题"""
         try:
             all_ious = []
             all_dices = []
             
             for pred, target in zip(predictions, targets):
+                # 处理维度
                 if pred.ndim > 2:
-                    pred = pred[0]  # 取第一个通道
+                    pred = pred[0] if pred.shape[0] == 1 else pred.mean(axis=0)  # 取第一个通道或平均
                 if target.ndim > 2:
-                    target = target[0]
+                    target = target[0] if target.shape[0] == 1 else target.mean(axis=0)
+                
+                # 🔧 关键修复：调整尺寸匹配
+                if pred.shape != target.shape:
+                    print(f"DEBUG: 调整预测掩码尺寸从 {pred.shape} 到 {target.shape}")
+                    
+                    # 使用最近邻插值调整预测掩码尺寸
+                    import torch.nn.functional as F
+                    import torch
+                    
+                    pred_tensor = torch.from_numpy(pred).unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
+                    target_size = target.shape
+                    
+                    # 调整到目标尺寸
+                    pred_resized = F.interpolate(
+                        pred_tensor, 
+                        size=target_size, 
+                        mode='bilinear',  # 使用双线性插值获得更好效果
+                        align_corners=False
+                    )
+                    pred = pred_resized.squeeze().numpy()
                 
                 # 二值化
                 pred_binary = (pred > 0.5).astype(np.int32)
@@ -461,14 +504,30 @@ class LoRATrainer:
                     
                     all_ious.append(iou)
                     all_dices.append(dice)
+                    
+                    # 详细调试信息
+                    print(f"DEBUG: pred_shape={pred_binary.shape}, target_shape={target_binary.shape}")
+                    print(f"DEBUG: intersection={intersection}, union={union}, IoU={iou:.4f}, Dice={dice:.4f}")
+                else:
+                    # 如果没有预测和真实目标，IoU和Dice都是0
+                    all_ious.append(0.0)
+                    all_dices.append(0.0)
+                    print(f"DEBUG: 空预测或空目标，IoU=0, Dice=0")
+            
+            avg_iou = np.mean(all_ious) if all_ious else 0.0
+            avg_dice = np.mean(all_dices) if all_dices else 0.0
+            
+            print(f"DEBUG: 验证完成，平均IoU={avg_iou:.4f}, 平均Dice={avg_dice:.4f}")
             
             return {
-                'val_iou': np.mean(all_ious) if all_ious else 0.0,
-                'val_dice': np.mean(all_dices) if all_dices else 0.0
+                'val_iou': avg_iou,
+                'val_dice': avg_dice
             }
             
         except Exception as e:
             print(f"分割指标计算失败: {e}")
+            import traceback
+            traceback.print_exc()
             return {'val_iou': 0.0, 'val_dice': 0.0}
     
     def log_metrics(self, train_metrics: Dict[str, float], 

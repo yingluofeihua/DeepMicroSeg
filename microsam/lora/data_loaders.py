@@ -47,20 +47,22 @@ class CellSegmentationDataset(Dataset):
         print(f"加载了 {len(self.samples)} 个{split}样本")
     
     def _load_samples(self) -> List[Dict]:
-        """加载数据样本 - 使用与dataset_manager相同的逻辑"""
+        """加载数据样本 - 支持细胞类型过滤"""
         samples = []
         
         try:
-            # 使用DatasetPathValidator来验证和发现数据集
             valid_datasets = DatasetPathValidator.validate_dataset_structure(self.data_dir)
-            
             print(f"发现 {len(valid_datasets)} 个有效数据集")
             
             for dataset_info in valid_datasets:
+                # 🔧 添加细胞类型过滤
+                if hasattr(self.config, '_cell_types_filter') and self.config._cell_types_filter:
+                    if dataset_info['cell_type'] not in self.config._cell_types_filter:
+                        continue  # 跳过不匹配的细胞类型
+                
                 images_dir = Path(dataset_info['images_dir'])
                 masks_dir = Path(dataset_info['masks_dir'])
                 
-                # 获取图像-掩码对
                 image_mask_pairs = self._get_image_mask_pairs(images_dir, masks_dir)
                 
                 for img_path, mask_path in image_mask_pairs:
@@ -74,10 +76,12 @@ class CellSegmentationDataset(Dataset):
                         'dataset_id': dataset_info['dataset_id']
                     })
             
-            # 数据集分割
+            # 打印过滤后的统计
+            if hasattr(self.config, '_cell_types_filter') and self.config._cell_types_filter:
+                print(f"过滤后样本数 ({self.config._cell_types_filter}): {len(samples)}")
+            
             samples = self._split_samples(samples)
             
-            # 过滤无效样本
             valid_samples = []
             for sample in samples:
                 if self._validate_sample(sample):

@@ -97,7 +97,7 @@ def add_train_arguments(parser):
     # 数据配置
     parser.add_argument('--data-dir', required=True, help='训练数据目录')
     parser.add_argument('--val-data-dir', help='验证数据目录')
-    parser.add_argument('--output-dir', default='./lora_experiments', help='输出目录')
+    parser.add_argument('--output-dir', default='./data/lora_experiments', help='输出目录')
     
     # 模型配置
     parser.add_argument('--model', choices=['vit_t_lm', 'vit_b_lm', 'vit_l_lm'], 
@@ -124,6 +124,12 @@ def add_train_arguments(parser):
     parser.add_argument('--use-wandb', action='store_true', help='使用Weights & Biases')
     parser.add_argument('--wandb-project', default='sam_lora_training', help='W&B项目名')
 
+    # 添加保存相关参数
+    parser.add_argument('--save-steps', type=int, default=500, help='保存检查点的步数间隔')
+    parser.add_argument('--eval-steps', type=int, default=100, help='验证的步数间隔')
+    parser.add_argument('--logging-steps', type=int, default=50, help='日志记录的步数间隔')
+    # 添加细胞类型过滤参数
+    parser.add_argument('--cell-types', nargs='+', help='要训练的细胞类型，如: --cell-types 293T MSC')
 
 def add_eval_arguments(parser):
     """添加评测相关参数"""
@@ -195,6 +201,12 @@ def create_config_from_args(args) -> LoRATrainingSettings:
         config.training.learning_rate = args.learning_rate
     if hasattr(args, 'weight_decay'):
         config.training.weight_decay = args.weight_decay
+    if hasattr(args, 'save_steps'):
+        config.training.save_steps = args.save_steps
+    if hasattr(args, 'eval_steps'):
+        config.training.eval_steps = args.eval_steps  
+    if hasattr(args, 'logging_steps'):
+        config.training.logging_steps = args.logging_steps
     
     # 实验配置
     if hasattr(args, 'experiment_name'):
@@ -203,6 +215,12 @@ def create_config_from_args(args) -> LoRATrainingSettings:
         config.experiment.use_wandb = args.use_wandb
     if hasattr(args, 'wandb_project'):
         config.experiment.wandb_project = args.wandb_project
+
+    # 添加细胞类型过滤
+    if hasattr(args, 'cell_types') and args.cell_types:
+        config._cell_types_filter = args.cell_types
+    else:
+        config._cell_types_filter = None
     
     # 调试模式
     if hasattr(args, 'debug') and args.debug:
@@ -251,20 +269,29 @@ def check_system_requirements():
 
 def train_lora_model(args) -> str:
     """训练LoRA模型"""
+    
+    # 检查是否需要分别训练多个细胞类型
+    if hasattr(args, 'cell_types') and args.cell_types and len(args.cell_types) > 1:
+        return train_multiple_cell_types(args)
+    
+    # 原来的单模型训练逻辑
     print("="*60)
     print("开始SAM LoRA微调训练")
     print("="*60)
     
-    # 检查系统要求
     check_system_requirements()
-    
-    # 创建配置
     config = create_config_from_args(args)
     
-    # 验证配置
     if not config.validate():
         print("配置验证失败")
         return None
+    
+    # 如果是单个细胞类型，添加到实验名称中
+    if hasattr(args, 'cell_types') and args.cell_types and len(args.cell_types) == 1:
+        cell_type = args.cell_types[0]
+        config.experiment.experiment_name = f"sam_lora_{cell_type.lower()}"
+        config.experiment.output_dir = f"{config.experiment.output_dir}_{cell_type.lower()}"
+        print(f"训练细胞类型: {cell_type}")
     
     # 打印配置信息
     print(f"\n训练配置:")
@@ -281,10 +308,7 @@ def train_lora_model(args) -> str:
     print(f"  输出目录: {config.experiment.output_dir}")
     print(f"  数据目录: {config.data.train_data_dir}")
     
-    # 创建训练器
     trainer = LoRATrainer(config)
-    
-    # 开始训练
     success = trainer.train()
     
     if success:
@@ -294,6 +318,58 @@ def train_lora_model(args) -> str:
     else:
         print("\n训练失败!")
         return None
+
+
+def train_multiple_cell_types(args) -> str:
+    """为多个细胞类型分别训练模型"""
+    print("="*60)
+    print("开始多细胞类型分别训练")
+    print("="*60)
+    print(f"将训练的细胞类型: {', '.join(args.cell_types)}")
+    
+    results = {}
+    
+    for cell_type in args.cell_types:
+        print(f"\n🔄 开始训练 {cell_type} 模型...")
+        
+        # 创建单个细胞类型的参数副本
+        single_args = type(args)()
+        for attr in dir(args):
+            if not attr.startswith('_'):
+                setattr(single_args, attr, getattr(args, attr))
+        
+        # 设置为单个细胞类型
+        single_args.cell_types = [cell_type]
+        
+        # 训练
+        model_path = train_lora_model(single_args)
+        results[cell_type] = model_path
+        
+        if model_path:
+            print(f"✅ {cell_type} 训练完成: {model_path}")
+        else:
+            print(f"❌ {cell_type} 训练失败")
+        
+        # 清理GPU内存
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # 生成摘要
+    print(f"\n{'='*60}")
+    print("多细胞类型训练完成")
+    print(f"{'='*60}")
+    
+    successful = sum(1 for path in results.values() if path)
+    print(f"成功训练: {successful}/{len(args.cell_types)}")
+    
+    for cell_type, path in results.items():
+        if path:
+            print(f"  ✅ {cell_type}: {path}")
+        else:
+            print(f"  ❌ {cell_type}: 失败")
+    
+    return f"多细胞类型训练完成，成功: {successful}/{len(args.cell_types)}"
 
 
 def resume_lora_training(args) -> str:

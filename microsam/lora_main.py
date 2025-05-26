@@ -2,6 +2,7 @@
 LoRA训练主入口文件 (修改版)
 支持LoRA微调和评测的完整流程
 使用新的SAM模型架构
+新增数据集划分功能
 """
 
 import sys
@@ -18,9 +19,11 @@ from core.lora_trainer import LoRATrainer, create_trainer_from_config, resume_tr
 from core.evaluator import BatchEvaluator
 from core.dataset_manager import DatasetManager
 from config.settings import BatchEvaluationSettings
-from lora.data_loaders import split_dataset
+from lora.data_loaders import split_dataset, list_cached_splits, clean_old_splits, preview_data_split
 from utils.file_utils import setup_logging
 from utils.model_utils import get_device_info, optimize_memory
+# 🔧 新增导入
+from utils.data_splitter import DatasetSplitter, print_split_summary
 
 
 def parse_arguments():
@@ -33,8 +36,11 @@ def parse_arguments():
   # 快速训练
   python lora_main.py train --preset quick --data-dir /path/to/data
   
-  # 标准训练
-  python lora_main.py train --data-dir /path/to/data --model vit_b_lm --epochs 10
+  # 标准训练（自动划分数据集）
+  python lora_main.py train --data-dir /path/to/data --model vit_b_lm --epochs 10 --test-split 0.2
+  
+  # 指定细胞类型和测试集比例
+  python lora_main.py train --data-dir /path/to/data --cell-types 293T --test-split 0.15
   
   # 从配置文件训练
   python lora_main.py train --config config.json
@@ -48,8 +54,11 @@ def parse_arguments():
   # 训练后自动评测
   python lora_main.py train-and-eval --data-dir /path/to/data --eval-data /path/to/eval
   
-  # 准备数据
-  python lora_main.py prepare-data --data-dir /path/to/data
+  # 准备数据/预览数据划分
+  python lora_main.py prepare-data --data-dir /path/to/data --test-split 0.2
+  
+  # 管理数据划分缓存
+  python lora_main.py manage-splits --list --clean --keep 5
         """
     )
     
@@ -75,10 +84,23 @@ def parse_arguments():
     add_eval_arguments(train_eval_parser)
     
     # 数据准备命令
-    data_parser = subparsers.add_parser('prepare-data', help='准备训练数据')
+    data_parser = subparsers.add_parser('prepare-data', help='准备训练数据/预览数据划分')
     data_parser.add_argument('--data-dir', required=True, help='数据目录')
     data_parser.add_argument('--train-ratio', type=float, default=0.8, help='训练集比例')
     data_parser.add_argument('--val-ratio', type=float, default=0.1, help='验证集比例')
+    # 🔧 新增：测试集比例参数
+    data_parser.add_argument('--test-split', type=float, default=0.1, help='测试集比例')
+    data_parser.add_argument('--cell-types', nargs='+', help='要处理的细胞类型')
+    data_parser.add_argument('--split-method', choices=['random', 'by_dataset'], default='random', help='划分方法')
+    data_parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    data_parser.add_argument('--preview-only', action='store_true', help='只预览，不创建实际划分')
+    
+    # 🔧 新增：数据划分管理命令
+    splits_parser = subparsers.add_parser('manage-splits', help='管理数据划分缓存')
+    splits_parser.add_argument('--list', action='store_true', help='列出所有缓存的划分')
+    splits_parser.add_argument('--clean', action='store_true', help='清理旧的划分文件')
+    splits_parser.add_argument('--keep', type=int, default=10, help='保留的最新划分数量')
+    splits_parser.add_argument('--split-dir', default='./data/lora_split', help='划分文件存储目录')
     
     # 模型信息命令
     info_parser = subparsers.add_parser('info', help='显示模型和系统信息')
@@ -98,6 +120,13 @@ def add_train_arguments(parser):
     parser.add_argument('--data-dir', required=True, help='训练数据目录')
     parser.add_argument('--val-data-dir', help='验证数据目录')
     parser.add_argument('--output-dir', default='./data/lora_experiments', help='输出目录')
+    
+    # 🔧 新增：数据划分参数
+    parser.add_argument('--test-split', type=float, default=0.1, help='测试集比例（0.0-1.0）')
+    parser.add_argument('--val-split', type=float, help='验证集比例（如果不指定，从train_ratio计算）')
+    parser.add_argument('--split-method', choices=['random', 'by_dataset'], default='random', help='数据划分方法')
+    parser.add_argument('--split-seed', type=int, default=42, help='数据划分随机种子')
+    parser.add_argument('--no-cached-split', action='store_true', help='不使用缓存的数据划分')
     
     # 模型配置
     parser.add_argument('--model', choices=['vit_t_lm', 'vit_b_lm', 'vit_l_lm'], 
@@ -175,6 +204,37 @@ def create_config_from_args(args) -> LoRATrainingSettings:
     if hasattr(args, 'model'):
         config.model.base_model_name = args.model
     
+    # 🔧 新增：数据划分配置
+    if hasattr(args, 'test_split'):
+        config.data.test_split_ratio = args.test_split
+        
+        # 自动调整训练集和验证集比例
+        if hasattr(args, 'val_split') and args.val_split is not None:
+            config.data.val_split_ratio = args.val_split
+            config.data.train_split_ratio = 1.0 - args.test_split - args.val_split
+        else:
+            # 如果测试集比例很高，设置验证集为0
+            if args.test_split >= 0.9:
+                config.data.val_split_ratio = 0.0
+                config.data.train_split_ratio = 1.0 - args.test_split
+            else:
+                # 保持原有验证集比例，调整训练集比例
+                remaining_ratio = 1.0 - args.test_split
+                config.data.train_split_ratio = remaining_ratio * 0.9
+                config.data.val_split_ratio = remaining_ratio * 0.1
+        
+        print(f"数据划分比例: train={config.data.train_split_ratio:.3f}, "
+              f"val={config.data.val_split_ratio:.3f}, test={config.data.test_split_ratio:.3f}")
+    
+    if hasattr(args, 'split_method'):
+        config.data.split_method = args.split_method
+        
+    if hasattr(args, 'split_seed'):
+        config.data.split_seed = args.split_seed
+        
+    if hasattr(args, 'no_cached_split'):
+        config.data.use_cached_split = not args.no_cached_split
+    
     # LoRA参数
     if hasattr(args, 'rank'):
         config.lora.rank = args.rank
@@ -218,9 +278,9 @@ def create_config_from_args(args) -> LoRATrainingSettings:
 
     # 添加细胞类型过滤
     if hasattr(args, 'cell_types') and args.cell_types:
-        config._cell_types_filter = args.cell_types
+        config.data._cell_types_filter = args.cell_types
     else:
-        config._cell_types_filter = None
+        config.data._cell_types_filter = None
     
     # 调试模式
     if hasattr(args, 'debug') and args.debug:
@@ -286,12 +346,44 @@ def train_lora_model(args) -> str:
         print("配置验证失败")
         return None
     
-    # 如果是单个细胞类型，添加到实验名称中
+    # 如果是单个细胞类型，创建更详细的实验名称
     if hasattr(args, 'cell_types') and args.cell_types and len(args.cell_types) == 1:
         cell_type = args.cell_types[0]
-        config.experiment.experiment_name = f"sam_lora_{cell_type.lower()}"
-        config.experiment.output_dir = f"{config.experiment.output_dir}_{cell_type.lower()}"
-        print(f"训练细胞类型: {cell_type}")
+        # 生成包含数据划分信息的实验名称
+        test_ratio = int(args.test_split * 100) if hasattr(args, 'test_split') else 10
+        val_ratio = int(args.val_split * 100) if hasattr(args, 'val_split') and args.val_split else 10
+        train_ratio = 100 - test_ratio - val_ratio
+        
+        split_suffix = f"train{train_ratio}_val{val_ratio}_test{test_ratio}"
+        config.experiment.experiment_name = f"sam_lora_{cell_type.lower()}_{split_suffix}"
+        config.experiment.output_dir = f"{config.experiment.output_dir}_{cell_type.lower()}_{split_suffix}"
+        
+    # 🔧 新增：预览数据划分
+    if hasattr(args, 'test_split') and args.test_split > 0:
+        print(f"\n预览数据划分...")
+        try:
+            preview_stats = preview_data_split(
+                data_dir=config.data.train_data_dir,
+                train_ratio=config.data.train_split_ratio,
+                val_ratio=config.data.val_split_ratio,
+                test_ratio=config.data.test_split_ratio,
+                cell_types=config.data._cell_types_filter,
+                split_method=config.data.split_method,
+                seed=config.data.split_seed,
+                split_storage_dir=config.data.split_storage_dir
+            )
+            
+            if preview_stats:
+                print(f"  总样本数: {preview_stats['total_samples']}")
+                print(f"  训练集: {preview_stats['train_count']} 样本")
+                print(f"  验证集: {preview_stats['val_count']} 样本")
+                print(f"  测试集: {preview_stats['test_count']} 样本")
+                
+                if 'cell_type_distribution' in preview_stats:
+                    print(f"  细胞类型分布: {preview_stats['cell_type_distribution']}")
+                    
+        except Exception as e:
+            print(f"预览数据划分失败: {e}")
     
     # 打印配置信息
     print(f"\n训练配置:")
@@ -531,26 +623,130 @@ def evaluate_lora_model(args, lora_model_path: str = None) -> bool:
 
 
 def prepare_training_data(args):
-    """准备训练数据"""
+    """准备训练数据/预览数据划分"""
     print("="*60)
-    print("准备训练数据")
+    print("准备训练数据 / 数据划分预览")
     print("="*60)
     
     data_dir = args.data_dir
     train_ratio = args.train_ratio
     val_ratio = args.val_ratio
+    test_ratio = getattr(args, 'test_split', 0.1)  # 🔧 新增：测试集比例
+    
+    # 🔧 新增：验证比例总和
+    total_ratio = train_ratio + val_ratio + test_ratio
+    if abs(total_ratio - 1.0) > 1e-6:
+        print(f"警告: 比例总和不为1.0 ({total_ratio})，正在自动归一化...")
+        train_ratio /= total_ratio
+        val_ratio /= total_ratio
+        test_ratio /= total_ratio
+    
+    cell_types = getattr(args, 'cell_types', None)
+    split_method = getattr(args, 'split_method', 'random')
+    seed = getattr(args, 'seed', 42)
+    preview_only = getattr(args, 'preview_only', False)
     
     print(f"数据目录: {data_dir}")
-    print(f"分割比例 - 训练: {train_ratio}, 验证: {val_ratio}, 测试: {1-train_ratio-val_ratio}")
+    print(f"分割比例 - 训练: {train_ratio:.3f}, 验证: {val_ratio:.3f}, 测试: {test_ratio:.3f}")
+    print(f"细胞类型过滤: {cell_types}")
+    print(f"分割方法: {split_method}")
+    print(f"随机种子: {seed}")
+    print(f"预览模式: {preview_only}")
     
     try:
-        split_dataset(data_dir, train_ratio, val_ratio)
+        if preview_only:
+            # 🔧 只预览，不创建实际文件
+            stats = preview_data_split(
+                data_dir=data_dir,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                test_ratio=test_ratio,
+                cell_types=cell_types,
+                split_method=split_method,
+                seed=seed
+            )
+            
+            if stats:
+                print(f"\n📊 数据划分预览:")
+                print(f"  总样本数: {stats['total_samples']}")
+                print(f"  训练集: {stats['train_count']} 样本 ({stats['train_count']/stats['total_samples']*100:.1f}%)")
+                print(f"  验证集: {stats['val_count']} 样本 ({stats['val_count']/stats['total_samples']*100:.1f}%)")
+                print(f"  测试集: {stats['test_count']} 样本 ({stats['test_count']/stats['total_samples']*100:.1f}%)")
+                
+                if 'cell_type_distribution' in stats:
+                    print(f"  细胞类型分布:")
+                    for cell_type, count in stats['cell_type_distribution'].items():
+                        print(f"    {cell_type}: {count} 样本")
+            else:
+                print("预览失败")
+        else:
+            # 🔧 创建实际的数据划分
+            from utils.data_splitter import create_data_split, print_split_summary
+            
+            split_result = create_data_split(
+                data_dir=data_dir,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                test_ratio=test_ratio,
+                cell_types=cell_types,
+                split_method=split_method,
+                seed=seed,
+                use_cached=True
+            )
+            
+            # 打印摘要
+            print_split_summary(split_result)
+            
         print("数据准备完成!")
+        
     except Exception as e:
         print(f"数据准备失败: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
+
+
+# 🔧 新增：数据划分管理功能
+def manage_data_splits(args):
+    """管理数据划分缓存"""
+    print("="*60)
+    print("数据划分缓存管理")
+    print("="*60)
+    
+    split_dir = args.split_dir
+    
+    if args.list:
+        print(f"📋 列出缓存的数据划分 (目录: {split_dir})")
+        try:
+            cached_splits = list_cached_splits(split_dir)
+            
+            if not cached_splits:
+                print("  没有找到缓存的数据划分")
+            else:
+                print(f"  找到 {len(cached_splits)} 个缓存文件:")
+                
+                for i, split_info in enumerate(cached_splits, 1):
+                    print(f"\n  {i}. 文件: {Path(split_info['file_path']).name}")
+                    print(f"     大小: {split_info['file_size_mb']:.2f} MB")
+                    print(f"     数据目录: {split_info.get('data_dir', 'N/A')}")
+                    print(f"     比例: train={split_info.get('train_ratio', 0):.2f}, "
+                          f"val={split_info.get('val_ratio', 0):.2f}, "
+                          f"test={split_info.get('test_ratio', 0):.2f}")
+                    print(f"     样本数: {split_info.get('total_samples', 0)}")
+                    if split_info.get('cell_types'):
+                        print(f"     细胞类型: {split_info['cell_types']}")
+                    print(f"     创建时间: {split_info.get('created_at', 'N/A')}")
+                        
+        except Exception as e:
+            print(f"列出缓存失败: {e}")
+    
+    if args.clean:
+        print(f"\n🧹 清理旧的数据划分文件 (保留最新 {args.keep} 个)")
+        try:
+            clean_old_splits(split_dir, args.keep)
+            print("清理完成!")
+        except Exception as e:
+            print(f"清理失败: {e}")
 
 
 def show_model_info(args):
@@ -629,6 +825,9 @@ def main():
         
         elif args.command == 'prepare-data':
             prepare_training_data(args)
+        
+        elif args.command == 'manage-splits':  # 🔧 新增命令
+            manage_data_splits(args)
         
         elif args.command == 'info':
             show_model_info(args)

@@ -76,18 +76,24 @@ class DataConfig:
     val_data_dir: str = ""
     test_data_dir: str = ""
     
+    # 🔧 新增：数据集划分配置
+    train_split_ratio: float = 0.8
+    val_split_ratio: float = 0.1
+    test_split_ratio: float = 0.1  # 新增测试集比例
+    split_method: str = "random"  # "random" 或 "by_dataset"
+    split_seed: int = 42  # 随机种子，确保可重现
+    split_storage_dir: str = "./data/lora_split"  # 划分结果存储目录
+    use_cached_split: bool = True  # 是否使用缓存的划分结果
+    
     # 数据处理
     image_size: tuple = (1024, 1024)  # SAM默认输入尺寸
     max_objects_per_image: int = 100
-    train_split_ratio: float = 0.8
-    val_split_ratio: float = 0.1
     
     # 数据加载
     batch_size: int = 8  # 添加批大小
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    # prefetch_factor: Optional[int] = None
     
     # 数据过滤
     min_object_size: int = 10
@@ -106,6 +112,17 @@ class DataConfig:
     # 归一化参数
     normalize_mean: List[float] = field(default_factory=lambda: [0.485, 0.456, 0.406])
     normalize_std: List[float] = field(default_factory=lambda: [0.229, 0.224, 0.225])
+    
+    def __post_init__(self):
+        """后处理：验证划分比例"""
+        total_ratio = self.train_split_ratio + self.val_split_ratio + self.test_split_ratio
+        if abs(total_ratio - 1.0) > 1e-6:
+            print(f"警告：数据集划分比例总和不为1.0 ({total_ratio})")
+            # 自动归一化
+            self.train_split_ratio /= total_ratio
+            self.val_split_ratio /= total_ratio
+            self.test_split_ratio /= total_ratio
+            print(f"自动归一化后：train={self.train_split_ratio:.3f}, val={self.val_split_ratio:.3f}, test={self.test_split_ratio:.3f}")
 
 
 @dataclass
@@ -181,6 +198,9 @@ class LoRATrainingSettings:
         Path(self.experiment.logging_dir).mkdir(parents=True, exist_ok=True)
         Path(self.experiment.cache_dir).mkdir(parents=True, exist_ok=True)
         
+        # 🔧 新增：创建数据集划分存储目录
+        Path(self.data.split_storage_dir).mkdir(parents=True, exist_ok=True)
+        
         # 同步批大小设置
         if hasattr(self.training, 'batch_size'):
             self.data.batch_size = self.training.batch_size
@@ -244,14 +264,26 @@ class LoRATrainingSettings:
         if not self.data.train_data_dir:
             errors.append("Training data directory is required")
         
+        # 🔧 新增：验证数据集划分比例
+        total_ratio = self.data.train_split_ratio + self.data.val_split_ratio + self.data.test_split_ratio
+        if abs(total_ratio - 1.0) > 1e-6:
+            errors.append(f"Data split ratios must sum to 1.0, got {total_ratio}")
+        
         if not (0 < self.data.train_split_ratio < 1):
             errors.append("Train split ratio must be between 0 and 1")
+        
+        if not (0 <= self.data.val_split_ratio < 1):
+            errors.append("Val split ratio must be between 0 and 1") 
+            
+        if not (0 <= self.data.test_split_ratio < 1):
+            errors.append("Test split ratio must be between 0 and 1")
         
         # 验证路径
         try:
             Path(self.experiment.output_dir).mkdir(parents=True, exist_ok=True)
+            Path(self.data.split_storage_dir).mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            errors.append(f"Cannot create output directory: {e}")
+            errors.append(f"Cannot create output directories: {e}")
         
         if errors:
             print("Configuration validation errors:")

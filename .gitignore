@@ -182,7 +182,7 @@ cython_debug/
 
 cache/
 data/
-document/
+# document/
 examples/
 logs/
 results/

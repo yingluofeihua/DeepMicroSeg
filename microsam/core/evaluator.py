@@ -19,7 +19,7 @@ from config.settings import BatchEvaluationSettings, ModelConfig
 from config.paths import PathManager
 from utils.file_utils import load_image, load_mask
 from utils.report_generator import ReportGenerator
-
+import numpy as np
 
 class TimeoutHandler:
     """超时处理器"""
@@ -78,9 +78,12 @@ class DatasetProcessor:
                     return dataset_id, "model_load_failed"
             
             # 获取图像-掩码对
-            from core.dataset_manager import DatasetManager
-            temp_manager = DatasetManager(str(Path(self.dataset_info.images_dir).parent.parent.parent))
-            image_mask_pairs = temp_manager.get_image_mask_pairs(self.dataset_info)
+            # from core.dataset_manager import DatasetManager
+            # temp_manager = DatasetManager(str(Path(self.dataset_info.images_dir).parent.parent.parent))
+            # image_mask_pairs = temp_manager.get_image_mask_pairs(self.dataset_info)
+            images_dir = Path(self.dataset_info.images_dir)
+            masks_dir = Path(self.dataset_info.masks_dir)
+            image_mask_pairs = self._get_direct_image_mask_pairs(images_dir, masks_dir)
             
             # 限制处理数量
             if self.config.evaluation.batch_size is not None:
@@ -204,7 +207,8 @@ class DatasetProcessor:
                 # 特殊处理HD95的无穷值
                 if col == 'hd95':
                     finite_values = values[pd.isna(values) == False]
-                    finite_values = finite_values[pd.isinf(finite_values) == False]
+                    # finite_values = finite_values[pd.isinf(finite_values) == False]
+                    finite_values = finite_values[~np.isinf(finite_values)]
                     avg_metrics[col] = float(finite_values.mean()) if len(finite_values) > 0 else float('inf')
                 else:
                     avg_metrics[col] = float(values.mean()) if len(values) > 0 else 0.0
@@ -222,6 +226,21 @@ class DatasetProcessor:
         })
         
         return avg_metrics
+    
+    def _get_direct_image_mask_pairs(self, images_dir, masks_dir):
+        from config.paths import DatasetPathValidator
+        image_extensions = ['.jpg', '.jpeg', '.png', '.tif', '.tiff']
+        image_files = []
+        for ext in image_extensions:
+            image_files.extend(list(images_dir.glob(f"*{ext}")))
+            image_files.extend(list(images_dir.glob(f"*{ext.upper()}")))
+        
+        pairs = []
+        for img_file in image_files:
+            mask_file = DatasetPathValidator.find_matching_mask(img_file, masks_dir)
+            if mask_file:
+                pairs.append((img_file, mask_file))
+        return pairs
 
 
 class BatchEvaluator:
@@ -407,6 +426,7 @@ class BatchEvaluator:
             'output_directory': self.config.output_base_dir,
             'cache_directory': self.config.cache_dir
         }
+
     
     def cleanup(self):
         """清理资源"""

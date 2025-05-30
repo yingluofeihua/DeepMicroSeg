@@ -362,7 +362,7 @@ class SAMDataset(CellSegmentationDataset):
             point_prompts = self._generate_point_prompts(masks)
             
             return {
-                'image': image,
+                'images': image,
                 'point_coords': point_prompts['coords'],
                 'point_labels': point_prompts['labels'],
                 'boxes': boxes,

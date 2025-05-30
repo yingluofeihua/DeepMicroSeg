@@ -195,27 +195,38 @@ class SAMLoRAWrapper(nn.Module):
                         param.requires_grad = True
     
     def forward(self, batch_inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """前向传播 - 修复设备一致性"""
+        """前向传播 - 512×512版本"""
         try:
             # 提取输入并获取设备
-            images = batch_inputs['images']  # [B, C, H, W]
+            images = batch_inputs['images']  # ✅ [B, 3, 512, 512]
             device = images.device
+            
+            # print(f"SAM输入图像尺寸: {images.shape}")  # [B, 3, 512, 512]
+            
+            # 🔧 关键修复：SAM原本期望1024×1024，但你使用512×512
+            # 有两种处理方式：
+            
+            # 方式1：上采样到1024×1024（推荐）
+            if images.shape[-1] != 1024 or images.shape[-2] != 1024:
+                # print(f"上采样图像从 {images.shape[-2:]} 到 (1024, 1024)")
+                images = F.interpolate(
+                    images, 
+                    size=(1024, 1024), 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                # print(f"上采样后图像尺寸: {images.shape}")  # [B, 3, 1024, 1024]
             
             # 🔧 确保所有模型组件都在正确设备上
             self._ensure_models_on_device(device)
             
             # 图像编码
             try:
-                image_embeddings = self.image_encoder(images)
+                image_embeddings = self.image_encoder(images)  # 输入 [B, 3, 1024, 1024]
+                # print(f"图像编码输出: {image_embeddings.shape}")  # [B, 256, 64, 64]
             except Exception as e:
                 print(f"图像编码失败: {e}")
                 raise
-            
-            # 准备提示输入
-            point_coords = batch_inputs.get('point_coords', [])
-            point_labels = batch_inputs.get('point_labels', [])
-            boxes = batch_inputs.get('boxes', [])
-            mask_inputs = batch_inputs.get('mask_inputs', None)
             
             # 批量处理每个样本
             batch_outputs = []
@@ -223,18 +234,16 @@ class SAMLoRAWrapper(nn.Module):
             
             for i in range(batch_size):
                 try:
-                    # 准备单个样本的输入
                     single_image_embedding = image_embeddings[i:i+1]
                     
                     # 提示编码
                     sparse_embeddings, dense_embeddings = self._encode_prompts(
-                        point_coords, point_labels, boxes, mask_inputs, i, device
+                        batch_inputs.get('point_coords', []), 
+                        batch_inputs.get('point_labels', []), 
+                        batch_inputs.get('boxes', []), 
+                        batch_inputs.get('mask_inputs', None), 
+                        i, device
                     )
-                    
-                    # 确保所有输入都在同一设备上
-                    single_image_embedding = single_image_embedding.to(device)
-                    sparse_embeddings = sparse_embeddings.to(device)
-                    dense_embeddings = dense_embeddings.to(device)
                     
                     # 获取位置编码
                     try:
@@ -243,38 +252,43 @@ class SAMLoRAWrapper(nn.Module):
                         image_pe = torch.zeros(1, 256, 64, 64, device=device)
                     
                     # 掩码解码
-                    try:
-                        low_res_masks, iou_predictions = self.mask_decoder(
-                            image_embeddings=single_image_embedding,
-                            image_pe=image_pe,
-                            sparse_prompt_embeddings=sparse_embeddings,
-                            dense_prompt_embeddings=dense_embeddings,
-                            multimask_output=batch_inputs.get('multimask_output', False)
+                    low_res_masks, iou_predictions = self.mask_decoder(
+                        image_embeddings=single_image_embedding,
+                        image_pe=image_pe,
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=batch_inputs.get('multimask_output', False)
+                    )
+                    
+                    # print(f"掩码解码输出: {low_res_masks.shape}")  # [1, 1, 256, 256]
+                    
+                    # 🔧 关键：将256×256的输出调整到512×512
+                    if low_res_masks.shape[-1] != 512:
+                        # print(f"调整掩码从 {low_res_masks.shape[-2:]} 到 (512, 512)")
+                        low_res_masks = F.interpolate(
+                            low_res_masks,
+                            size=(512, 512),
+                            mode='bilinear',
+                            align_corners=False
                         )
-                        
-                        batch_outputs.append({
-                            'masks': low_res_masks,
-                            'iou_predictions': iou_predictions
-                        })
-                        
-                    except Exception as e:
-                        print(f"掩码解码失败 (样本 {i}): {e}")
-                        default_size = (256, 256)
-                        batch_outputs.append({
-                            'masks': torch.zeros(1, 1, *default_size, device=device),
-                            'iou_predictions': torch.zeros(1, 1, device=device)
-                        })
-                        
+                        # print(f"调整后掩码尺寸: {low_res_masks.shape}")  # [1, 1, 512, 512]
+                    
+                    batch_outputs.append({
+                        'masks': low_res_masks,      # ✅ [1, 1, 512, 512]
+                        'iou_predictions': iou_predictions
+                    })
+                    
                 except Exception as e:
                     print(f"处理样本 {i} 失败: {e}")
-                    default_size = (256, 256)
+                    # 返回512×512的默认输出
                     batch_outputs.append({
-                        'masks': torch.zeros(1, 1, *default_size, device=device),
+                        'masks': torch.zeros(1, 1, 512, 512, device=device),
                         'iou_predictions': torch.zeros(1, 1, device=device)
                     })
             
             # 合并批量输出
             result = self._merge_batch_outputs(batch_outputs)
+            # print(f"最终输出掩码尺寸: {result['masks'].shape}")  # [B, 1, 512, 512]
             
             return result
             
@@ -283,11 +297,11 @@ class SAMLoRAWrapper(nn.Module):
             import traceback
             traceback.print_exc()
             
-            # 返回默认输出
+            # 返回512×512的默认输出
             device = batch_inputs['images'].device
             batch_size = batch_inputs['images'].shape[0]
             return {
-                'masks': torch.zeros(batch_size, 1, 256, 256, device=device),
+                'masks': torch.zeros(batch_size, 1, 512, 512, device=device),
                 'iou_predictions': torch.zeros(batch_size, 1, device=device)
             }
         

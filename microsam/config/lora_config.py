@@ -86,7 +86,7 @@ class DataConfig:
     use_cached_split: bool = True  # 是否使用缓存的划分结果
     
     # 数据处理
-    image_size: tuple = (1024, 1024)  # SAM默认输入尺寸
+    image_size: tuple = (512, 512)  # SAM默认输入尺寸
     max_objects_per_image: int = 100
     
     # 数据加载

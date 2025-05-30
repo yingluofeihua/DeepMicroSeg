@@ -143,10 +143,10 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
     """准备SAM训练的输入和目标 - 修复多实例掩码处理"""
     
     try:
-        # print(f"batch: {batch}")
+        # print(f"batch: {batch.keys()}")
         # 输入数据
         inputs = {
-            'images': batch['image'],  # [B, C, H, W]
+            'images': batch['images'],  # [B, C, H, W]
             'point_coords': batch.get('point_coords', []),
             'point_labels': batch.get('point_labels', []),
             'boxes': batch.get('boxes', []),

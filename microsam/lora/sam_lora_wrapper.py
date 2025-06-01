@@ -199,7 +199,10 @@ class SAMLoRAWrapper(nn.Module):
         try:
             # 提取输入并获取设备
             images = batch_inputs['images']  # ✅ [B, 3, 512, 512]
+            if images.dim() == 3:                  # 单样本但没 batch 维
+                images = images.unsqueeze(0)       # 变成 [1,3,H,W]
             device = images.device
+            # print(f"images: {images.shape}")
             
             # print(f"SAM输入图像尺寸: {images.shape}")  # [B, 3, 512, 512]
             
@@ -216,7 +219,7 @@ class SAMLoRAWrapper(nn.Module):
                     align_corners=False
                 )
                 # print(f"上采样后图像尺寸: {images.shape}")  # [B, 3, 1024, 1024]
-            
+            # print(f"images11111: {images.shape}")
             # 🔧 确保所有模型组件都在正确设备上
             self._ensure_models_on_device(device)
             

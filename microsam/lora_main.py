@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 import json
 import torch
-
+import numpy as np
 # 添加项目根目录到Python路径
 sys.path.append(str(Path(__file__).parent))
 
@@ -291,51 +291,52 @@ def evaluate_lora_model_enhanced(args, lora_model_path: str = None) -> bool:
                 print(f"加载划分文件失败: {e}")
                 return False
         
-        # 如果没有从划分文件加载，则使用传统方式
-        if test_samples is None:
-            print("使用传统数据加载方式...")
+    #     # 如果没有从划分文件加载，则使用传统方式
+    #     if test_samples is None:
+    #         print("使用传统数据加载方式...")
             
-            # 确定评测数据
-            eval_data_dir = getattr(args, 'eval_data', None) or getattr(args, 'data_dir', None)
-            if not eval_data_dir:
-                print("错误: 未指定评测数据目录")
-                return False
+    #         # 确定评测数据
+    #         eval_data_dir = getattr(args, 'eval_data', None) or getattr(args, 'data_dir', None)
+    #         if not eval_data_dir:
+    #             print("错误: 未指定评测数据目录")
+    #             return False
             
-            # 创建评测数据加载器 - 使用传统方式
-            from lora.data_loaders import create_data_loaders
-            from config.lora_config import DataConfig
+    #         # 创建评测数据加载器 - 使用传统方式
+    #         from lora.data_loaders import create_data_loaders
+    #         from config.lora_config import DataConfig
             
-            data_config = DataConfig()
-            data_config.test_data_dir = eval_data_dir
+    #         data_config = DataConfig()
+    #         data_config.test_data_dir = eval_data_dir
             
-            data_loaders = create_data_loaders(data_config, dataset_type="sam")
-            if 'test' not in data_loaders:
-                print("无法创建测试数据加载器")
-                return False
+    #         data_loaders = create_data_loaders(data_config, dataset_type="sam")
+    #         if 'test' not in data_loaders:
+    #             print("无法创建测试数据加载器")
+    #             return False
             
-            test_loader = data_loaders['test']
+    #         test_loader = data_loaders['test']
             
-        else:
-            # 🔧 新增：从样本列表创建数据加载器
-            from lora.data_loaders import SAMDataset
-            from torch.utils.data import DataLoader
-            from config.lora_config import DataConfig
-            
-            data_config = DataConfig()
-            test_dataset = SAMDataset(
-                data_dir=None,
-                config=data_config,
-                split='test',
-                samples=test_samples  # 直接传入样本列表
-            )
-            
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=1,
-                shuffle=False,
-                num_workers=0,  # 避免多进程问题
-                collate_fn=lambda x: x[0] if len(x) == 1 else x  # 简单的collate函数
-            )
+    #     else:
+        # 🔧 新增：从样本列表创建数据加载器
+        from lora.data_loaders import SAMDataset
+        from torch.utils.data import DataLoader
+        from config.lora_config import DataConfig
+        
+        print(f"test_samples: {test_samples}")
+        data_config = DataConfig()
+        test_dataset = SAMDataset(
+            data_dir=None,
+            config=data_config,
+            split='test',
+            samples=test_samples  # 直接传入样本列表
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,  # 避免多进程问题
+            collate_fn=lambda x: x[0] if len(x) == 1 else x  # 简单的collate函数
+        )
         
         print(f"测试数据: {len(test_loader)} 批次")
         
@@ -349,8 +350,6 @@ def evaluate_lora_model_enhanced(args, lora_model_path: str = None) -> bool:
         print("开始评测...")
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
-                if batch_idx >= 100:  # 限制评测数量
-                    break
                 
                 try:
                     # 准备输入 - 处理不同的数据格式
@@ -369,9 +368,12 @@ def evaluate_lora_model_enhanced(args, lora_model_path: str = None) -> bool:
                     
                     # 模型预测
                     predictions = lora_model(inputs)
+                    print(predictions)
                     
                     # 计算指标
-                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    # pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    pred_masks = predictions['masks'].cpu().numpy()
+                    # print(f"pred_masks: {pred_masks}")
                     target_masks = targets['masks'].cpu().numpy()
                     
                     for pred, target in zip(pred_masks, target_masks):
@@ -381,7 +383,9 @@ def evaluate_lora_model_enhanced(args, lora_model_path: str = None) -> bool:
                             target = target[0]
                         
                         pred_binary = (pred > 0.5).astype(int)
+                        print(f"pred_binary: {np.sum(pred_binary)}")
                         target_binary = (target > 0.5).astype(int)
+                        print(f"target_binary: {np.sum(target_binary)}")
                         
                         result = metrics_calculator.compute_all_metrics(target_binary, pred_binary)
                         result_dict = result.to_dict()

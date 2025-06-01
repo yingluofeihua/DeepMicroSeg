@@ -191,3 +191,4 @@ registration/
 models/
 documentation/
 local_micro/
+batch_evaluation_results/

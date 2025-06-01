@@ -143,6 +143,7 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
     """准备SAM训练的输入和目标 - 修复多实例掩码处理"""
     
     try:
+        # print(f"batch: {batch.keys()}")
         # 输入数据
         inputs = {
             'images': batch['images'],  # [B, C, H, W]
@@ -155,62 +156,65 @@ def prepare_sam_inputs(batch: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         
         # 目标数据
         ground_truth_masks = batch['ground_truth_masks']  # [B, N, H, W]
-        
+        # print(f"ground_truth_masks: {ground_truth_masks}")
+        # print(ground_truth_masks.shape)
         # 确保在正确设备上
         device = inputs['images'].device
+
+        targets_masks = ground_truth_masks.to(device)
         
-        if isinstance(ground_truth_masks, torch.Tensor):
-            targets_masks = ground_truth_masks.to(device)
+        # if isinstance(ground_truth_masks, torch.Tensor):
+        #     targets_masks = ground_truth_masks.to(device)
             
-            # 🔧 关键修复：处理多实例掩码
-            if targets_masks.shape[1] > 1:
-                # 方案1：合并所有实例为单个二进制掩码
-                binary_masks = (targets_masks.sum(dim=1, keepdim=True) > 0).float()
-                targets_masks = binary_masks
+        #     # 🔧 关键修复：处理多实例掩码
+        #     if targets_masks.shape[1] > 1:
+        #         # 方案1：合并所有实例为单个二进制掩码
+        #         binary_masks = (targets_masks.sum(dim=1, keepdim=True) > 0).float()
+        #         targets_masks = binary_masks
             
-        else:
-            # 向后兼容处理
-            print(f"WARNING: ground_truth_masks还是列表格式，转换为张量")
+        # else:
+        #     # 向后兼容处理
+        #     print(f"WARNING: ground_truth_masks还是列表格式，转换为张量")
             
-            if isinstance(ground_truth_masks, list):
-                processed_masks = []
+        #     if isinstance(ground_truth_masks, list):
+        #         processed_masks = []
                 
-                for i, masks in enumerate(ground_truth_masks):
-                    if isinstance(masks, torch.Tensor):
-                        masks = masks.to(device)
-                        if len(masks.shape) == 2:
-                            masks = masks.unsqueeze(0)
+        #         for i, masks in enumerate(ground_truth_masks):
+        #             if isinstance(masks, torch.Tensor):
+        #                 masks = masks.to(device)
+        #                 if len(masks.shape) == 2:
+        #                     masks = masks.unsqueeze(0)
                         
-                        # 如果有多个实例，合并为二进制掩码
-                        if masks.shape[0] > 1:
-                            binary_mask = (masks.sum(dim=0, keepdim=True) > 0).float()
-                            processed_masks.append(binary_mask)
-                        else:
-                            processed_masks.append(masks)
-                    else:
-                        h, w = inputs['images'].shape[-2:]
-                        default_mask = torch.zeros(1, h, w, dtype=torch.float32, device=device)
-                        processed_masks.append(default_mask)
+        #                 # 如果有多个实例，合并为二进制掩码
+        #                 if masks.shape[0] > 1:
+        #                     binary_mask = (masks.sum(dim=0, keepdim=True) > 0).float()
+        #                     processed_masks.append(binary_mask)
+        #                 else:
+        #                     processed_masks.append(masks)
+        #             else:
+        #                 h, w = inputs['images'].shape[-2:]
+        #                 default_mask = torch.zeros(1, h, w, dtype=torch.float32, device=device)
+        #                 processed_masks.append(default_mask)
                 
-                # 统一形状并堆叠
-                target_size = processed_masks[0].shape[-2:]
-                unified_masks = []
+        #         # 统一形状并堆叠
+        #         target_size = processed_masks[0].shape[-2:]
+        #         unified_masks = []
                 
-                for masks in processed_masks:
-                    if masks.shape[-2:] != target_size:
-                        masks = torch.nn.functional.interpolate(
-                            masks.unsqueeze(1).float(),
-                            size=target_size,
-                            mode='nearest'
-                        ).squeeze(1)
-                    unified_masks.append(masks)
+        #         for masks in processed_masks:
+        #             if masks.shape[-2:] != target_size:
+        #                 masks = torch.nn.functional.interpolate(
+        #                     masks.unsqueeze(1).float(),
+        #                     size=target_size,
+        #                     mode='nearest'
+        #                 ).squeeze(1)
+        #             unified_masks.append(masks)
                 
-                targets_masks = torch.stack(unified_masks)
-            else:
-                # 创建默认张量
-                batch_size = inputs['images'].shape[0]
-                h, w = inputs['images'].shape[-2:]
-                targets_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.float32, device=device)
+        #         targets_masks = torch.stack(unified_masks)
+        #     else:
+        #         # 创建默认张量
+        #         batch_size = inputs['images'].shape[0]
+        #         h, w = inputs['images'].shape[-2:]
+        #         targets_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.float32, device=device)
         
         targets = {
             'masks': targets_masks  # [B, 1, H, W] - 现在是单个二进制掩码

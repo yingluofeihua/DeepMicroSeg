@@ -1,8 +1,6 @@
 """
-LoRA训练主入口文件 (修改版)
-支持LoRA微调和评测的完整流程
-使用新的SAM模型架构
-新增数据集划分功能
+LoRA训练主入口文件 (修复版)
+修复 --cell-types 参数重复定义导致的冲突问题
 """
 
 import sys
@@ -10,7 +8,7 @@ import argparse
 from pathlib import Path
 import json
 import torch
-
+import numpy as np
 # 添加项目根目录到Python路径
 sys.path.append(str(Path(__file__).parent))
 
@@ -22,12 +20,11 @@ from config.settings import BatchEvaluationSettings
 from lora.data_loaders import split_dataset, list_cached_splits, clean_old_splits, preview_data_split
 from utils.file_utils import setup_logging
 from utils.model_utils import get_device_info, optimize_memory
-# 🔧 新增导入
 from utils.data_splitter import DatasetSplitter, print_split_summary
 
 
 def parse_arguments():
-    """解析命令行参数"""
+    """解析命令行参数 - 修复参数冲突"""
     parser = argparse.ArgumentParser(
         description="SAM LoRA微调训练系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -49,7 +46,7 @@ def parse_arguments():
   python lora_main.py resume --checkpoint /path/to/checkpoint.pth
   
   # 评测LoRA模型
-  python lora_main.py evaluate --lora-model /path/to/lora --data-dir /path/to/data
+  python lora_main.py evaluate --lora-model /path/to/lora --split-file /path/to/split.json
   
   # 训练后自动评测
   python lora_main.py train-and-eval --data-dir /path/to/data --eval-data /path/to/eval
@@ -74,28 +71,28 @@ def parse_arguments():
     resume_parser.add_argument('--checkpoint', required=True, help='检查点文件路径')
     resume_parser.add_argument('--config', help='配置文件路径（可选）')
     
-    # 评测命令
+    # 评测命令 - 使用新的增强评测参数
     eval_parser = subparsers.add_parser('evaluate', help='评测LoRA模型')
-    add_eval_arguments(eval_parser)
+    add_enhanced_eval_arguments(eval_parser)
     
-    # 训练+评测命令
+    # 🔧 修复：训练+评测命令 - 只添加训练参数，评测部分手动添加避免冲突
     train_eval_parser = subparsers.add_parser('train-and-eval', help='训练后自动评测')
     add_train_arguments(train_eval_parser)
-    add_eval_arguments(train_eval_parser)
+    # 手动添加评测相关参数，避免与训练参数冲突
+    add_eval_arguments_no_conflict(train_eval_parser)
     
     # 数据准备命令
     data_parser = subparsers.add_parser('prepare-data', help='准备训练数据/预览数据划分')
     data_parser.add_argument('--data-dir', required=True, help='数据目录')
     data_parser.add_argument('--train-ratio', type=float, default=0.8, help='训练集比例')
     data_parser.add_argument('--val-ratio', type=float, default=0.1, help='验证集比例')
-    # 🔧 新增：测试集比例参数
     data_parser.add_argument('--test-split', type=float, default=0.1, help='测试集比例')
     data_parser.add_argument('--cell-types', nargs='+', help='要处理的细胞类型')
     data_parser.add_argument('--split-method', choices=['random', 'by_dataset'], default='random', help='划分方法')
     data_parser.add_argument('--seed', type=int, default=42, help='随机种子')
     data_parser.add_argument('--preview-only', action='store_true', help='只预览，不创建实际划分')
     
-    # 🔧 新增：数据划分管理命令
+    # 数据划分管理命令
     splits_parser = subparsers.add_parser('manage-splits', help='管理数据划分缓存')
     splits_parser.add_argument('--list', action='store_true', help='列出所有缓存的划分')
     splits_parser.add_argument('--clean', action='store_true', help='清理旧的划分文件')
@@ -121,7 +118,7 @@ def add_train_arguments(parser):
     parser.add_argument('--val-data-dir', help='验证数据目录')
     parser.add_argument('--output-dir', default='./data/lora_experiments', help='输出目录')
     
-    # 🔧 新增：数据划分参数
+    # 数据划分参数
     parser.add_argument('--test-split', type=float, default=0.1, help='测试集比例（0.0-1.0）')
     parser.add_argument('--val-split', type=float, help='验证集比例（如果不指定，从train_ratio计算）')
     parser.add_argument('--split-method', choices=['random', 'by_dataset'], default='random', help='数据划分方法')
@@ -147,27 +144,336 @@ def add_train_arguments(parser):
     parser.add_argument('--batch-size', type=int, default=8, help='批大小')
     parser.add_argument('--learning-rate', type=float, default=1e-4, help='学习率')
     parser.add_argument('--weight-decay', type=float, default=0.01, help='权重衰减')
+    parser.add_argument('--save-steps', type=int, default=500, help='保存检查点的步数间隔')
+    parser.add_argument('--eval-steps', type=int, default=100, help='验证的步数间隔')
+    parser.add_argument('--logging-steps', type=int, default=50, help='日志记录的步数间隔')
     
     # 实验配置
     parser.add_argument('--experiment-name', default='sam_lora_finetune', help='实验名称')
     parser.add_argument('--use-wandb', action='store_true', help='使用Weights & Biases')
     parser.add_argument('--wandb-project', default='sam_lora_training', help='W&B项目名')
-
-    # 添加保存相关参数
-    parser.add_argument('--save-steps', type=int, default=500, help='保存检查点的步数间隔')
-    parser.add_argument('--eval-steps', type=int, default=100, help='验证的步数间隔')
-    parser.add_argument('--logging-steps', type=int, default=50, help='日志记录的步数间隔')
-    # 添加细胞类型过滤参数
+    
+    # 细胞类型过滤参数
     parser.add_argument('--cell-types', nargs='+', help='要训练的细胞类型，如: --cell-types 293T MSC')
 
-def add_eval_arguments(parser):
-    """添加评测相关参数"""
+
+def add_enhanced_eval_arguments(parser):
+    """添加增强的评测相关参数"""
+    # 基本评测参数
     parser.add_argument('--lora-model', help='LoRA模型路径')
-    parser.add_argument('--eval-data', help='评测数据目录')
+    parser.add_argument('--split-file', help='数据划分文件路径（JSON格式）')
     parser.add_argument('--eval-output', help='评测结果输出目录')
+    
+    # 🔧 修复：只在纯评测命令中添加 cell-types 参数
+    parser.add_argument('--cell-types', nargs='+', help='细胞类型过滤')
+    
+    # 批量测试选项
+    parser.add_argument('--batch-test', action='store_true', help='批量测试模式（使用划分文件中的测试集）')
+    parser.add_argument('--max-samples', type=int, help='最大测试样本数量限制')
+    
+    # 评测选项
     parser.add_argument('--compare-baseline', action='store_true', help='与基础模型对比')
+    parser.add_argument('--save-detailed', action='store_true', help='保存详细的评测结果')
+    parser.add_argument('--save-predictions', action='store_true', help='保存预测结果图像')
+    
+    # 模型相关
+    parser.add_argument('--model-type', choices=['vit_t_lm', 'vit_b_lm', 'vit_l_lm'], 
+                       default='vit_b_lm', help='基础模型类型')
+    parser.add_argument('--device', default='auto', help='计算设备')
+    
+    # 度量相关
+    parser.add_argument('--metrics', nargs='+', 
+                       choices=['ap50', 'ap75', 'iou', 'dice', 'hd95'],
+                       default=['ap50', 'ap75', 'iou', 'dice'],
+                       help='要计算的评测指标')
+    
+    # 可视化
+    parser.add_argument('--generate-plots', action='store_true', help='生成可视化图表')
+    parser.add_argument('--plot-examples', type=int, default=10, help='可视化示例数量')
+    
+    # 通用参数（在子命令中重复定义以支持位置灵活性）
+    parser.add_argument('--verbose', '-v', action='store_true', help='详细输出')
+    parser.add_argument('--debug', action='store_true', help='调试模式')
 
 
+def add_eval_arguments_no_conflict(parser):
+    """为train-and-eval命令添加评测参数，避免与训练参数冲突"""
+    # 注意：不添加 --cell-types 因为训练参数中已经有了
+    
+    # 基本评测参数
+    parser.add_argument('--eval-output', help='评测结果输出目录')
+    parser.add_argument('--split-file', help='数据划分文件路径（JSON格式）')
+    
+    # 批量测试选项
+    parser.add_argument('--batch-test', action='store_true', help='批量测试模式（使用划分文件中的测试集）')
+    parser.add_argument('--max-samples', type=int, help='最大测试样本数量限制')
+    
+    # 评测选项
+    parser.add_argument('--compare-baseline', action='store_true', help='与基础模型对比')
+    parser.add_argument('--save-detailed', action='store_true', help='保存详细的评测结果')
+    parser.add_argument('--save-predictions', action='store_true', help='保存预测结果图像')
+    
+    # 度量相关
+    parser.add_argument('--metrics', nargs='+', 
+                       choices=['ap50', 'ap75', 'iou', 'dice', 'hd95'],
+                       default=['ap50', 'ap75', 'iou', 'dice'],
+                       help='要计算的评测指标')
+    
+    # 可视化
+    parser.add_argument('--generate-plots', action='store_true', help='生成可视化图表')
+    parser.add_argument('--plot-examples', type=int, default=10, help='可视化示例数量')
+
+
+# 🔧 新增：增强的评测函数，支持从划分文件加载数据
+def evaluate_lora_model_enhanced(args, lora_model_path: str = None) -> bool:
+    """增强的LoRA模型评测 - 支持从划分文件加载测试数据"""
+    print("="*60)
+    print("开始SAM LoRA模型评测 (增强版)")
+    print("="*60)
+    
+    # 确定模型路径
+    if lora_model_path is None:
+        lora_model_path = args.lora_model
+    
+    if not lora_model_path:
+        print("错误: 未指定LoRA模型路径")
+        return False
+    
+    try:
+        # 加载LoRA模型
+        from lora.sam_lora_wrapper import load_sam_lora_model
+        from core.metrics import ComprehensiveMetrics
+        from lora.training_utils import prepare_sam_inputs
+        
+        print(f"LoRA模型路径: {lora_model_path}")
+        
+        # 确定模型类型
+        model_type = getattr(args, 'model_type', 'vit_b_lm')
+        
+        # 加载LoRA模型
+        lora_model = load_sam_lora_model(model_type, lora_model_path)
+        if lora_model is None:
+            print("LoRA模型加载失败")
+            return False
+        
+        print("LoRA模型加载成功")
+        
+        # 🔧 新增：从划分文件加载测试数据
+        test_samples = None
+        if hasattr(args, 'split_file') and args.split_file:
+            print(f"从划分文件加载测试数据: {args.split_file}")
+            
+            try:
+                import json
+                with open(args.split_file, 'r', encoding='utf-8') as f:
+                    split_data = json.load(f)
+                
+                if 'test_samples' in split_data:
+                    test_samples = split_data['test_samples']
+                    print(f"从划分文件加载了 {len(test_samples)} 个测试样本")
+                    
+                    # 细胞类型过滤
+                    if hasattr(args, 'cell_types') and args.cell_types:
+                        filtered_samples = [s for s in test_samples if s.get('cell_type') in args.cell_types]
+                        test_samples = filtered_samples
+                        print(f"细胞类型过滤后: {len(test_samples)} 个样本")
+                    
+                    # 限制样本数量
+                    if hasattr(args, 'max_samples') and args.max_samples and len(test_samples) > args.max_samples:
+                        test_samples = test_samples[:args.max_samples]
+                        print(f"限制样本数量: {len(test_samples)} 个样本")
+                        
+                else:
+                    print("划分文件中没有找到测试样本")
+                    return False
+                    
+            except Exception as e:
+                print(f"加载划分文件失败: {e}")
+                return False
+        
+    #     # 如果没有从划分文件加载，则使用传统方式
+    #     if test_samples is None:
+    #         print("使用传统数据加载方式...")
+            
+    #         # 确定评测数据
+    #         eval_data_dir = getattr(args, 'eval_data', None) or getattr(args, 'data_dir', None)
+    #         if not eval_data_dir:
+    #             print("错误: 未指定评测数据目录")
+    #             return False
+            
+    #         # 创建评测数据加载器 - 使用传统方式
+    #         from lora.data_loaders import create_data_loaders
+    #         from config.lora_config import DataConfig
+            
+    #         data_config = DataConfig()
+    #         data_config.test_data_dir = eval_data_dir
+            
+    #         data_loaders = create_data_loaders(data_config, dataset_type="sam")
+    #         if 'test' not in data_loaders:
+    #             print("无法创建测试数据加载器")
+    #             return False
+            
+    #         test_loader = data_loaders['test']
+            
+    #     else:
+        # 🔧 新增：从样本列表创建数据加载器
+        from lora.data_loaders import SAMDataset
+        from torch.utils.data import DataLoader
+        from config.lora_config import DataConfig
+        
+        print(f"test_samples: {test_samples}")
+        data_config = DataConfig()
+        test_dataset = SAMDataset(
+            data_dir=None,
+            config=data_config,
+            split='test',
+            samples=test_samples  # 直接传入样本列表
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,  # 避免多进程问题
+            collate_fn=lambda x: x[0] if len(x) == 1 else x  # 简单的collate函数
+        )
+        
+        print(f"测试数据: {len(test_loader)} 批次")
+        
+        # 创建指标计算器
+        metrics_calculator = ComprehensiveMetrics()
+        
+        # 进行评测
+        lora_model.eval()
+        all_results = []
+        
+        print("开始评测...")
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_loader):
+                
+                try:
+                    # 准备输入 - 处理不同的数据格式
+                    if isinstance(batch, dict):
+                        # 标准的批次格式
+                        inputs, targets = prepare_sam_inputs(batch)
+                    else:
+                        # 简单格式，需要转换
+                        sample = batch
+                        batch_formatted = {
+                            'images': sample['image'].unsqueeze(0),
+                            'ground_truth_masks': sample['masks'].unsqueeze(0),
+                            'sample_ids': [sample['sample_id']]
+                        }
+                        inputs, targets = prepare_sam_inputs(batch_formatted)
+                    
+                    # 模型预测
+                    predictions = lora_model(inputs)
+                    print(predictions)
+                    
+                    # 计算指标
+                    # pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    pred_masks = predictions['masks'].cpu().numpy()
+                    # print(f"pred_masks: {pred_masks}")
+                    target_masks = targets['masks'].cpu().numpy()
+                    
+                    for pred, target in zip(pred_masks, target_masks):
+                        if pred.ndim > 2:
+                            pred = pred[0]
+                        if target.ndim > 2:
+                            target = target[0]
+                        
+                        pred_binary = (pred > 0.5).astype(int)
+                        print(f"pred_binary: {np.sum(pred_binary)}")
+                        target_binary = (target > 0.5).astype(int)
+                        print(f"target_binary: {np.sum(target_binary)}")
+                        
+                        result = metrics_calculator.compute_all_metrics(target_binary, pred_binary)
+                        result_dict = result.to_dict()
+                        
+                        # 添加元数据
+                        if isinstance(batch, dict) and batch_idx < len(batch.get('sample_ids', [])):
+                            result_dict['sample_id'] = batch['sample_ids'][batch_idx]
+                        else:
+                            result_dict['sample_id'] = f"sample_{batch_idx}"
+                        
+                        all_results.append(result_dict)
+                
+                except Exception as e:
+                    print(f"评测批次 {batch_idx} 失败: {e}")
+                    if hasattr(args, 'verbose') and args.verbose:
+                        import traceback
+                        traceback.print_exc()
+                    continue
+        
+        # 计算平均指标
+        if all_results:
+            avg_metrics = {}
+            for key in all_results[0].keys():
+                if key == 'sample_id':
+                    continue
+                    
+                values = [r[key] for r in all_results if key in r and r[key] is not None]
+                if values:
+                    if key == 'hd95':
+                        finite_values = [v for v in values if not (v == float('inf') or v != v)]
+                        avg_metrics[key] = sum(finite_values) / len(finite_values) if finite_values else float('inf')
+                    else:
+                        avg_metrics[key] = sum(values) / len(values)
+            
+            print(f"\n评测结果 (基于 {len(all_results)} 个样本):")
+            for key, value in avg_metrics.items():
+                if key == 'hd95' and value == float('inf'):
+                    print(f"  {key}: inf")
+                else:
+                    print(f"  {key}: {value:.4f}")
+            
+            # 保存结果
+            if hasattr(args, 'eval_output') and args.eval_output:
+                output_dir = Path(args.eval_output)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 保存详细结果
+                if hasattr(args, 'save_detailed') and args.save_detailed:
+                    import pandas as pd
+                    results_df = pd.DataFrame(all_results)
+                    results_file = output_dir / "detailed_evaluation_results.csv"
+                    results_df.to_csv(results_file, index=False)
+                    print(f"详细结果已保存到: {results_file}")
+                
+                # 保存摘要结果
+                results_file = output_dir / "lora_evaluation_results.json"
+                with open(results_file, 'w') as f:
+                    json.dump({
+                        'average_metrics': avg_metrics,
+                        'individual_results': all_results if len(all_results) <= 1000 else all_results[:1000],  # 限制大小
+                        'model_path': lora_model_path,
+                        'evaluation_config': {
+                            'model_type': model_type,
+                            'num_samples': len(all_results),
+                            'split_file': getattr(args, 'split_file', None),
+                            'cell_types': getattr(args, 'cell_types', None),
+                            'max_samples': getattr(args, 'max_samples', None)
+                        }
+                    }, f, indent=2)
+                
+                print(f"评测结果已保存到: {results_file}")
+        
+        else:
+            print("没有有效的评测结果")
+            return False
+        
+        print("LoRA模型评测完成!")
+        return True
+        
+    except Exception as e:
+        print(f"LoRA模型评测失败: {e}")
+        if hasattr(args, 'verbose') and args.verbose:
+            import traceback
+            traceback.print_exc()
+        return False
+
+
+# 其他函数保持不变...
 def create_config_from_args(args) -> LoRATrainingSettings:
     """从命令行参数创建配置"""
     
@@ -204,7 +510,7 @@ def create_config_from_args(args) -> LoRATrainingSettings:
     if hasattr(args, 'model'):
         config.model.base_model_name = args.model
     
-    # 🔧 新增：数据划分配置
+    # 数据划分配置
     if hasattr(args, 'test_split'):
         config.data.test_split_ratio = args.test_split
         
@@ -358,7 +664,7 @@ def train_lora_model(args) -> str:
         config.experiment.experiment_name = f"sam_lora_{cell_type.lower()}_{split_suffix}"
         config.experiment.output_dir = f"{config.experiment.output_dir}_{cell_type.lower()}_{split_suffix}"
         
-    # 🔧 新增：预览数据划分
+    # 预览数据划分
     if hasattr(args, 'test_split') and args.test_split > 0:
         print(f"\n预览数据划分...")
         try:
@@ -482,146 +788,6 @@ def resume_lora_training(args) -> str:
         return None
 
 
-def evaluate_lora_model(args, lora_model_path: str = None) -> bool:
-    """评测LoRA模型"""
-    print("="*60)
-    print("开始SAM LoRA模型评测")
-    print("="*60)
-    
-    # 确定模型路径
-    if lora_model_path is None:
-        lora_model_path = args.lora_model
-    
-    if not lora_model_path:
-        print("错误: 未指定LoRA模型路径")
-        return False
-    
-    # 确定评测数据
-    eval_data_dir = getattr(args, 'eval_data', None) or getattr(args, 'data_dir', None)
-    if not eval_data_dir:
-        print("错误: 未指定评测数据目录")
-        return False
-    
-    try:
-        # 加载LoRA模型进行评测
-        from lora.sam_lora_wrapper import load_sam_lora_model
-        from core.metrics import ComprehensiveMetrics
-        from lora.data_loaders import create_data_loaders
-        from config.lora_config import DataConfig
-        
-        print(f"LoRA模型路径: {lora_model_path}")
-        print(f"评测数据目录: {eval_data_dir}")
-        
-        # 创建评测数据加载器
-        data_config = DataConfig()
-        data_config.test_data_dir = eval_data_dir
-        
-        data_loaders = create_data_loaders(data_config, dataset_type="sam")
-        if 'test' not in data_loaders:
-            print("无法创建测试数据加载器")
-            return False
-        
-        test_loader = data_loaders['test']
-        print(f"测试数据: {len(test_loader)} 批次")
-        
-        # 加载LoRA模型
-        model_type = "vit_b_lm"  # 默认模型类型，可以从配置中读取
-        lora_model = load_sam_lora_model(model_type, lora_model_path)
-        
-        if lora_model is None:
-            print("LoRA模型加载失败")
-            return False
-        
-        print("LoRA模型加载成功")
-        
-        # 创建指标计算器
-        metrics_calculator = ComprehensiveMetrics()
-        
-        # 进行评测
-        lora_model.eval()
-        all_results = []
-        
-        print("开始评测...")
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(test_loader):
-                if batch_idx >= 10:  # 限制评测数量
-                    break
-                
-                try:
-                    # 准备输入
-                    from lora.training_utils import prepare_sam_inputs
-                    inputs, targets = prepare_sam_inputs(batch)
-                    
-                    # 模型预测
-                    predictions = lora_model(inputs)
-                    
-                    # 计算指标
-                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
-                    target_masks = targets['masks'].cpu().numpy()
-                    
-                    for pred, target in zip(pred_masks, target_masks):
-                        if pred.ndim > 2:
-                            pred = pred[0]
-                        if target.ndim > 2:
-                            target = target[0]
-                        
-                        pred_binary = (pred > 0.5).astype(int)
-                        target_binary = (target > 0.5).astype(int)
-                        
-                        result = metrics_calculator.compute_all_metrics(target_binary, pred_binary)
-                        all_results.append(result.to_dict())
-                
-                except Exception as e:
-                    print(f"评测批次 {batch_idx} 失败: {e}")
-                    continue
-        
-        # 计算平均指标
-        if all_results:
-            avg_metrics = {}
-            for key in all_results[0].keys():
-                values = [r[key] for r in all_results if key in r and r[key] is not None]
-                if values:
-                    if key == 'hd95':
-                        finite_values = [v for v in values if not (v == float('inf') or v != v)]
-                        avg_metrics[key] = sum(finite_values) / len(finite_values) if finite_values else float('inf')
-                    else:
-                        avg_metrics[key] = sum(values) / len(values)
-            
-            print(f"\n评测结果 (基于 {len(all_results)} 个样本):")
-            for key, value in avg_metrics.items():
-                print(f"  {key}: {value:.4f}")
-            
-            # 保存结果
-            if hasattr(args, 'eval_output') and args.eval_output:
-                output_dir = Path(args.eval_output)
-                output_dir.mkdir(parents=True, exist_ok=True)
-                
-                results_file = output_dir / "lora_evaluation_results.json"
-                with open(results_file, 'w') as f:
-                    json.dump({
-                        'average_metrics': avg_metrics,
-                        'individual_results': all_results,
-                        'model_path': lora_model_path,
-                        'data_path': eval_data_dir
-                    }, f, indent=2)
-                
-                print(f"评测结果已保存到: {results_file}")
-        
-        else:
-            print("没有有效的评测结果")
-            return False
-        
-        print("LoRA模型评测完成!")
-        return True
-        
-    except Exception as e:
-        print(f"LoRA模型评测失败: {e}")
-        if hasattr(args, 'verbose') and args.verbose:
-            import traceback
-            traceback.print_exc()
-        return False
-
-
 def prepare_training_data(args):
     """准备训练数据/预览数据划分"""
     print("="*60)
@@ -631,9 +797,9 @@ def prepare_training_data(args):
     data_dir = args.data_dir
     train_ratio = args.train_ratio
     val_ratio = args.val_ratio
-    test_ratio = getattr(args, 'test_split', 0.1)  # 🔧 新增：测试集比例
+    test_ratio = getattr(args, 'test_split', 0.1)
     
-    # 🔧 新增：验证比例总和
+    # 验证比例总和
     total_ratio = train_ratio + val_ratio + test_ratio
     if abs(total_ratio - 1.0) > 1e-6:
         print(f"警告: 比例总和不为1.0 ({total_ratio})，正在自动归一化...")
@@ -655,7 +821,7 @@ def prepare_training_data(args):
     
     try:
         if preview_only:
-            # 🔧 只预览，不创建实际文件
+            # 只预览，不创建实际文件
             stats = preview_data_split(
                 data_dir=data_dir,
                 train_ratio=train_ratio,
@@ -680,7 +846,7 @@ def prepare_training_data(args):
             else:
                 print("预览失败")
         else:
-            # 🔧 创建实际的数据划分
+            # 创建实际的数据划分
             from utils.data_splitter import create_data_split, print_split_summary
             
             split_result = create_data_split(
@@ -706,7 +872,6 @@ def prepare_training_data(args):
             traceback.print_exc()
 
 
-# 🔧 新增：数据划分管理功能
 def manage_data_splits(args):
     """管理数据划分缓存"""
     print("="*60)
@@ -810,7 +975,8 @@ def main():
             resume_lora_training(args)
         
         elif args.command == 'evaluate':
-            evaluate_lora_model(args)
+            # 🔧 使用增强的评测函数
+            evaluate_lora_model_enhanced(args)
         
         elif args.command == 'train-and-eval':
             # 先训练
@@ -821,12 +987,13 @@ def main():
                 print("\n" + "="*60)
                 print("开始自动评测")
                 print("="*60)
-                evaluate_lora_model(args, lora_model_path)
+                # 🔧 使用增强的评测函数
+                evaluate_lora_model_enhanced(args, lora_model_path)
         
         elif args.command == 'prepare-data':
             prepare_training_data(args)
         
-        elif args.command == 'manage-splits':  # 🔧 新增命令
+        elif args.command == 'manage-splits':
             manage_data_splits(args)
         
         elif args.command == 'info':

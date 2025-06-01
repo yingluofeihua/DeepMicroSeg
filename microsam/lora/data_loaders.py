@@ -267,7 +267,6 @@ class CellSegmentationDataset(Dataset):
         
         # 生成实例掩码和边界框
         instance_masks, boxes = self._process_mask(mask)
-        
         return {
             'image': image,
             'masks': instance_masks,
@@ -355,43 +354,26 @@ class SAMDataset(CellSegmentationDataset):
         image = sample['image']
         masks = sample['masks']
         boxes = sample['boxes']
-        
         # 为SAM准备输入
-        if len(boxes) > 0:
-            # 随机选择一些点作为prompt
-            point_prompts = self._generate_point_prompts(masks)
-            
-            return {
-                'image': image,
-                'point_coords': point_prompts['coords'],
-                'point_labels': point_prompts['labels'],
-                'boxes': boxes,
-                'mask_inputs': None,  # 可以为None
-                'multimask_output': False,
-                'ground_truth_masks': masks,
-                'sample_id': sample['sample_id'],
-                'cell_type': sample['cell_type'],
-                'date': sample['date'],
-                'magnification': sample['magnification'],
-                'dataset_id': sample['dataset_id']
-            }
-        else:
-            # 没有对象的情况
-            h, w = image.shape[-2:]
-            return {
-                'image': image,
-                'point_coords': torch.zeros(0, 2),
-                'point_labels': torch.zeros(0),
-                'boxes': torch.zeros(0, 4),
-                'mask_inputs': None,
-                'multimask_output': False,
-                'ground_truth_masks': torch.zeros(0, h, w),
-                'sample_id': sample['sample_id'],
-                'cell_type': sample['cell_type'],
-                'date': sample['date'],
-                'magnification': sample['magnification'],
-                'dataset_id': sample['dataset_id']
-            }
+
+        # 随机选择一些点作为prompt
+        point_prompts = self._generate_point_prompts(masks)
+        
+        return {
+            'images': image,
+            'point_coords': point_prompts['coords'],
+            'point_labels': point_prompts['labels'],
+            'boxes': boxes,
+            'mask_inputs': None,  # 可以为None
+            'multimask_output': False,
+            'ground_truth_masks': masks,
+            'sample_id': sample['sample_id'],
+            'cell_type': sample['cell_type'],
+            'date': sample['date'],
+            'magnification': sample['magnification'],
+            'dataset_id': sample['dataset_id']
+        }
+
     
     def _generate_point_prompts(self, masks: torch.Tensor) -> Dict[str, torch.Tensor]:
         """为每个掩码生成点提示"""
@@ -637,7 +619,7 @@ def collate_fn(batch):
     
     # 收集所有数据
     for item in batch:
-        images.append(item['image'])
+        images.append(item['images'])
         
         if 'point_coords' in item:
             all_point_coords.append(item['point_coords'])
@@ -653,7 +635,7 @@ def collate_fn(batch):
             masks = item['masks']
         else:
             # 创建默认的空掩码
-            h, w = item['image'].shape[-2:]
+            h, w = item['images'].shape[-2:]
             masks = torch.zeros(1, h, w, dtype=torch.long)
         
         # 确保掩码是张量格式
@@ -661,7 +643,7 @@ def collate_fn(batch):
             if isinstance(masks, np.ndarray):
                 masks = torch.from_numpy(masks)
             else:
-                h, w = item['image'].shape[-2:]
+                h, w = item['images'].shape[-2:]
                 masks = torch.zeros(1, h, w, dtype=torch.long)
         
         # 确保是3D张量 [N, H, W]

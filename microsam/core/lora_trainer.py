@@ -295,7 +295,7 @@ class LoRATrainer:
                 
                 # 验证
                 val_metrics = self.validate() if 'val' in self.data_loaders else {}
-                
+
                 # 记录日志
                 self.log_metrics(train_metrics, val_metrics, epoch)
                 

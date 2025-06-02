@@ -191,3 +191,35 @@ registration/
 models/
 documentation/
 local_micro/
+
+
+# ===== Micro-SAM 相关缓存和大文件 =====
+# 忽略 micro_sam_cache 缓存目录（包含模型权重、评测结果、图像嵌入等大文件）
+microsam/Retrain/micro_sam_cache/
+**/micro_sam_cache/
+
+# 忽略评测结果目录
+**/batch_evaluation_results_*/
+**/summary_report_*/
+
+# 忽略模型checkpoint文件
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# 忽略大型数据集
+**/patch_*/
+**/datasets/
+**/raw_data/
+
+# 忽略图像嵌入和特征缓存
+**/embeddings_cache/
+**/features_cache/
+**/precomputed_*/
+
+# 忽略可视化和临时文件
+**/visualizations/
+**/overlays/
+**/temp_*/
+**/tmp_*/

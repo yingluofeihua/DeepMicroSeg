@@ -383,30 +383,29 @@ class BatchEvaluationConfig:
         self.models = [
             {
                 "name": "vit_t",
-                "model_type": "vit_t", 
+                "model_type": "vit_t_lm", 
                 "checkpoint_path": None  # 使用默认模型
             },
             {
                 "name": "vit_b", 
-                "model_type": "vit_b",
+                "model_type": "vit_b_lm",
                 "checkpoint_path": None  # 使用默认模型
             },
             {
                 "name": "vit_l",
-                "model_type": "vit_l", 
+                "model_type": "vit_l_lm", 
                 "checkpoint_path": None  # 使用默认模型
             },
             {
-                "name": "vit_h",
-                "model_type": "vit_h", 
-                "checkpoint_path": None  # 使用默认模型
+                "name": "Bfonly",  # 你的自定义模型
+                "model_type": "vit_b_lm",  # 基础模型类型
+                "checkpoint_path": "/LD-FS/home/yunshuchen/micro_sam/optimized_training_results_0522/checkpoints/checkpoints/microsam_optimized_patches/best.pt"
             },
-            # 自定义模型示例 - 请根据实际情况修改
-            # {
-            #     "name": "custom_vit_b",  # 你的自定义模型
-            #     "model_type": "vit_b_lm",  # 基础模型类型
-            #     "checkpoint_path": str(self.cache_root / "checkpoints" / "custom_models" / "best.pt")
-            # },
+                        {
+                "name": "Flonly",  # 你的自定义模型
+                "model_type": "vit_b_lm",  # 基础模型类型
+                "checkpoint_path": "/LD-FS/home/yunshuchen/micro_sam/optimized_training_results/checkpoints/checkpoints/microsam_optimized_patches/best.pt"
+            }
         ]
         
         # 硬件配置
@@ -1011,7 +1010,10 @@ def process_dataset_worker(args):
                 
                 # 随机选择样本
                 num_to_visualize = min(config.visual_size, len(visualization_candidates))
+                random.seed(config.visualization_seed)
+                np.random.seed(config.visualization_seed)
                 random_indices = random.sample(range(len(visualization_candidates)), num_to_visualize)
+                print(f"Selected indices: {sorted(random_indices)}")  # 显示选择的索引
                 
                 print(f"Creating {num_to_visualize} visualizations for {dataset_info['dataset_id']}...")
                 for idx in random_indices:
@@ -1291,8 +1293,9 @@ def main():
         print()
     
     # 设置批处理大小和运行模式
-    config.batch_size = 100
+    config.batch_size = None
     config.enable_visualization = True
+    config.visualization_seed = 42
     config.visual_size = 15
     config.save_overlays = True
     config.draw_grid = True

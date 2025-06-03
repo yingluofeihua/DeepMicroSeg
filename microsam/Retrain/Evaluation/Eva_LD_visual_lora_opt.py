@@ -31,6 +31,7 @@ import math
 from micro_sam.automatic_segmentation import get_predictor_and_segmenter, automatic_instance_segmentation
 from micro_sam.util import get_sam_model
 from micro_sam.instance_segmentation import get_predictor_and_decoder, InstanceSegmentationWithDecoder
+from micro_sam.instance_segmentation import AutomaticMaskGenerator, mask_data_to_segmentation
 
 # 设置matplotlib使用非交互式后端
 import matplotlib
@@ -346,17 +347,17 @@ class LoRAExperimentConfig:
                 'name': 'split_0.18_0.02_0.80',
                 'base_dir': '/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/lora_split',
                 'cell_types': ['293T', 'MSC', 'RBD', 'VERO']
-            },
-            'split_0.27_0.03_0.70': {
-                'name': 'split_0.27_0.03_0.70',
-                'base_dir': '/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/lora_split',
-                'cell_types': ['293T', 'MSC', 'RBD', 'VERO']
-            },
-            'split_0.36_0.04_0.60': {
-                'name': 'split_0.36_0.04_0.60',
-                'base_dir': '/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/lora_split',
-                'cell_types': ['293T', 'MSC', 'RBD', 'VERO']
             }
+            # 'split_0.27_0.03_0.70': {
+            #     'name': 'split_0.27_0.03_0.70',
+            #     'base_dir': '/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/lora_split',
+            #     'cell_types': ['293T', 'MSC', 'RBD', 'VERO']
+            # },
+            # 'split_0.36_0.04_0.60': {
+            #     'name': 'split_0.36_0.04_0.60',
+            #     'base_dir': '/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/lora_split',
+            #     'cell_types': ['293T', 'MSC', 'RBD', 'VERO']
+            # }
         }
         
         # LoRA checkpoint配置
@@ -376,6 +377,14 @@ class LoRAExperimentConfig:
                 "lora_rank": 8,
                 "attention_layers": [9, 10, 11],
                 "cell_type_trained": "RBD"
+            },
+            {
+                "name": "lora_rbd_vit_b_lm_r8", 
+                "model_type": "vit_b_lm",
+                "checkpoint_path": "/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/results/MSC/checkpoints/cells_lora/best.pt",
+                "lora_rank": 8,
+                "attention_layers": [9, 10, 11],
+                "cell_type_trained": "MSC"
             }
         ]
         
@@ -407,8 +416,11 @@ class LoRAExperimentConfig:
         self.generate_unified_csv = True
 
 def setup_model_safe(model_config: Dict, gpu_id: int = None):
-    """增强的模型设置 - 修复PyTorch 2.6兼容性"""
+    """基于示例代码的LoRA加载方式 - 直接加载权重到SAM模型"""
     import torch
+    import sys
+    import types
+    
     try:
         if gpu_id is not None and torch.cuda.is_available():
             torch.cuda.set_device(gpu_id)
@@ -430,122 +442,134 @@ def setup_model_safe(model_config: Dict, gpu_id: int = None):
         if checkpoint_path and Path(checkpoint_path).exists():
             print(f"  Loading LoRA checkpoint from: {checkpoint_path}")
             
-            # 临时修复PyTorch 2.6的weights_only问题
-            import torch.serialization
-            
-            # 诊断checkpoint内容（修复PyTorch 2.6兼容性）
-            try:
-                # 使用weights_only=False来加载包含自定义类的checkpoint
-                checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-                print(f"  Checkpoint keys: {list(checkpoint.keys())}")
+            # 创建虚拟的datasets_simple模块来解决pickle问题
+            if 'datasets_simple' not in sys.modules:
+                print("  Creating dummy datasets_simple module...")
+                datasets_simple = types.ModuleType('datasets_simple')
                 
-                # 检查是否包含LoRA相关的键
-                lora_keys = [k for k in checkpoint.keys() if 'lora' in k.lower() or 'peft' in k.lower()]
-                if lora_keys:
-                    print(f"  Found LoRA keys: {lora_keys[:5]}{'...' if len(lora_keys) > 5 else ''}")
+                # 创建完整的PatchDataset类（基于你提供的代码）
+                class DummyPatchDataset:
+                    def __init__(self, img_dir=None, mask_dir=None, *args, **kwargs):
+                        self.img_dir = img_dir
+                        self.mask_dir = mask_dir
+                        # 其他可能的参数
+                        for key, value in kwargs.items():
+                            setattr(self, key, value)
+                    
+                    def __len__(self):
+                        return 0
+                    
+                    def __getitem__(self, idx):
+                        return None, None
+                    
+                    def __getstate__(self):
+                        return self.__dict__
+                    
+                    def __setstate__(self, state):
+                        self.__dict__.update(state)
+                
+                # 还需要添加encode_instance_map函数（虽然不会被调用）
+                def encode_instance_map(inst_map, sigma=3):
+                    import numpy as np
+                    import torch
+                    H, W = inst_map.shape
+                    center = np.zeros((H, W), np.float32)
+                    offsetx = np.zeros((H, W), np.float32)
+                    offsety = np.zeros((H, W), np.float32)
+                    scale = np.zeros((H, W), np.float32)
+                    label = np.stack([center, offsetx, offsety, scale], axis=0)
+                    return torch.from_numpy(label).float()
+                
+                datasets_simple.PatchDataset = DummyPatchDataset
+                datasets_simple.encode_instance_map = encode_instance_map
+                sys.modules['datasets_simple'] = datasets_simple
+                print("  ✓ Dummy datasets_simple module with PatchDataset created")
+            
+            try:
+                # 方法：仿照示例代码的直接加载方式
+                print("  Method: Direct LoRA loading (based on sample code)...")
+                
+                # 1. 加载基础模型（返回predictor和sam_model）
+                predictor, sam_model = get_sam_model(
+                    model_type=model_type, 
+                    device=device, 
+                    return_sam=True
+                )
+                print("  ✓ Base model loaded")
+                
+                # 2. 加载LoRA权重
+                state = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                print(f"  Checkpoint top-level keys: {list(state.keys())}")
+                
+                # 3. 提取PEFT状态（更新优先级，包含model_state）
+                peft_state = state.get('model_state', state.get('model', state.get('sam', state.get('state_dict', state))))
+                
+                if peft_state is state.get('model_state'):
+                    print("  Using 'model_state' key from checkpoint")
+                elif peft_state is state.get('model'):
+                    print("  Using 'model' key from checkpoint")
+                elif peft_state is state.get('sam'):
+                    print("  Using 'sam' key from checkpoint")
+                elif peft_state is state.get('state_dict'):
+                    print("  Using 'state_dict' key from checkpoint")
                 else:
-                    print("  Warning: No LoRA keys found in checkpoint")
+                    print("  Using entire checkpoint as model state")
                 
-                # 检查是否有decoder
-                decoder_keys = [k for k in checkpoint.keys() if 'decoder' in k.lower()]
-                has_decoder = len(decoder_keys) > 0
-                print(f"  Decoder found: {has_decoder}")
-                if has_decoder:
-                    print(f"  Decoder keys: {decoder_keys[:3]}{'...' if len(decoder_keys) > 3 else ''}")
+                print(f"  PEFT state keys count: {len(peft_state.keys()) if isinstance(peft_state, dict) else 'Not a dict'}")
                 
-            except Exception as inspect_error:
-                print(f"  Error inspecting checkpoint: {inspect_error}")
-            
-            # 临时设置torch.load的默认行为为旧版本
-            original_load = torch.load
-            def patched_load(*args, **kwargs):
-                if 'weights_only' not in kwargs:
-                    kwargs['weights_only'] = False
-                return original_load(*args, **kwargs)
-            
-            torch.load = patched_load
-            
-            try:
-                peft_kwargs = {
-                    "rank": model_config.get("lora_rank", 8),
-                    "attention_layers_to_update": model_config.get("attention_layers", [9, 10, 11])
-                }
-                print(f"  PEFT config: rank={peft_kwargs['rank']}, layers={peft_kwargs['attention_layers_to_update']}")
-                
-                # 尝试方法1: 直接加载checkpoint到基础模型
-                try:
-                    print("  Method 1: Loading checkpoint directly to base model...")
+                # 4. 检查并修复权重键的前缀问题
+                if isinstance(peft_state, dict):
+                    # 检查是否所有键都有sam.前缀
+                    sample_keys = list(peft_state.keys())[:5]
+                    print(f"  Sample keys: {sample_keys}")
                     
-                    # 首先加载基础模型
-                    predictor = get_sam_model(
-                        model_type=model_type,
-                        device=device
-                    )
+                    if all(key.startswith('sam.') for key in peft_state.keys()):
+                        print("  Detected 'sam.' prefix in all keys, removing prefix...")
+                        # 移除sam.前缀
+                        fixed_state = {}
+                        for key, value in peft_state.items():
+                            new_key = key[4:] if key.startswith('sam.') else key  # 移除'sam.'前缀
+                            fixed_state[new_key] = value
+                        peft_state = fixed_state
+                        print(f"  Fixed state keys count: {len(peft_state)}")
+                        print(f"  Sample fixed keys: {list(peft_state.keys())[:5]}")
                     
-                    # 尝试加载checkpoint权重（修复PyTorch 2.6兼容性）
-                    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-                    
-                    # 过滤模型权重（排除优化器状态等）
-                    if 'model_state_dict' in checkpoint:
-                        model_state_dict = checkpoint['model_state_dict']
-                    elif 'state_dict' in checkpoint:
-                        model_state_dict = checkpoint['state_dict']
+                    # 检查LoRA权重（更新检测逻辑）
+                    lora_keys = [k for k in peft_state.keys() if any(lora_term in k.lower() for lora_term in ['lora', 'w_a_linear', 'w_b_linear', 'qkv_proj'])]
+                    if lora_keys:
+                        print(f"  Found {len(lora_keys)} LoRA parameters")
+                        print(f"  Sample LoRA keys: {lora_keys[:3]}{'...' if len(lora_keys) > 3 else ''}")
                     else:
-                        model_state_dict = checkpoint
+                        print("  Warning: No LoRA keys found in PEFT state")
+                
+                # 5. 直接加载到sam_model，忽略不匹配的键（按示例代码）
+                missing_keys, unexpected_keys = sam_model.load_state_dict(peft_state, strict=False)
+                print(f"  Load result - Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+                
+                if len(missing_keys) > 0:
+                    print(f"  Sample missing keys: {missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''}")
+                if len(unexpected_keys) > 0:
+                    print(f"  Sample unexpected keys: {unexpected_keys[:3]}{'...' if len(unexpected_keys) > 3 else ''}")
+                
+                # 6. 设置模型为评估模式
+                sam_model.eval()
+                if device.startswith('cuda'):
+                    sam_model.cuda()
+                
+                print("  ✓ LoRA weights loaded successfully using direct method!")
+                
+                # 7. 为分割任务准备segmenter - 使用AutomaticMaskGenerator
+                segmenter = None  # 将在后面使用AMG
+                
+                return predictor, segmenter
+                
+            except Exception as lora_error:
+                print(f"  ✗ LoRA loading failed: {lora_error}")
+                import traceback
+                traceback.print_exc()
+                print("  Falling back to default model...")
                     
-                    # 尝试加载权重
-                    missing_keys, unexpected_keys = predictor.load_state_dict(model_state_dict, strict=False)
-                    print(f"  Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-                    
-                    if len(missing_keys) > 0:
-                        print(f"  Sample missing keys: {missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''}")
-                    if len(unexpected_keys) > 0:
-                        print(f"  Sample unexpected keys: {unexpected_keys[:3]}{'...' if len(unexpected_keys) > 3 else ''}")
-                    
-                    segmenter = None  # 使用AMG
-                    print("  ✓ Successfully loaded checkpoint weights directly")
-                    return predictor, segmenter
-                    
-                except Exception as direct_error:
-                    print(f"  ✗ Direct loading failed: {direct_error}")
-                    
-                    # 尝试方法2: 使用PEFT加载
-                    try:
-                        print("  Method 2: Attempting PEFT loading with decoder...")
-                        predictor, decoder = get_predictor_and_decoder(
-                            model_type=model_type,
-                            checkpoint_path=checkpoint_path,
-                            device=device,
-                            peft_kwargs=peft_kwargs
-                        )
-                        segmenter = InstanceSegmentationWithDecoder(predictor, decoder)
-                        print("  ✓ Successfully loaded LoRA model with decoder")
-                        return predictor, segmenter
-                        
-                    except Exception as decoder_error:
-                        print(f"  ✗ PEFT decoder loading failed: {decoder_error}")
-                        
-                        # 尝试方法3: 使用PEFT但不使用decoder
-                        try:
-                            print("  Method 3: Attempting PEFT loading without decoder...")
-                            predictor = get_sam_model(
-                                model_type=model_type,
-                                checkpoint_path=checkpoint_path,
-                                device=device,
-                                peft_kwargs=peft_kwargs
-                            )
-                            segmenter = None
-                            print("  ✓ Successfully loaded LoRA SAM (will use AMG)")
-                            return predictor, segmenter
-                            
-                        except Exception as sam_error:
-                            print(f"  ✗ PEFT SAM loading failed: {sam_error}")
-                            print("  All LoRA loading methods failed, falling back to default model...")
-            
-            finally:
-                # 恢复原始的torch.load
-                torch.load = original_load
-                    
+        # 使用默认模型
         print("  Using default model")
         predictor, segmenter = get_predictor_and_segmenter(
             model_type=model_type,
@@ -554,7 +578,8 @@ def setup_model_safe(model_config: Dict, gpu_id: int = None):
             is_tiled=False
         )
         print("  ✓ Default model loaded")
-        print("  WARNING: This is NOT using your LoRA checkpoint!")
+        if checkpoint_path:
+            print("  WARNING: This is NOT using your LoRA checkpoint!")
         return predictor, segmenter
         
     except Exception as e:
@@ -564,6 +589,8 @@ def setup_model_safe(model_config: Dict, gpu_id: int = None):
         return None, None
 
 def process_test_samples_worker(args):
+    from micro_sam.instance_segmentation import AutomaticMaskGenerator, mask_data_to_segmentation
+    from segment_anything import SamAutomaticMaskGenerator  # 可选，仅当你仍可能 fallback 使用
     """Worker函数处理测试样本 - 增强版含可视化"""
     (test_samples, model_config, output_dir, config, test_set_name) = args
     
@@ -624,17 +651,47 @@ def process_test_samples_worker(args):
                     print(f"Warning: Files not found for {sample_id}, skipping...")
                     continue
                 
-                # 加载和处理图像
-                image = io.imread(img_path)
-                if len(image.shape) > 2:
-                    image_for_display = image.copy()
-                    image_for_seg = image[:, :, 0]
-                else:
-                    image_for_display = image
-                    image_for_seg = image
+                # 加载和处理图像 - 增强版错误处理
+                try:
+                    image = io.imread(img_path)
+                    print(f"  Debug: Image {sample_id} shape: {image.shape}, dtype: {image.dtype}")
+                    
+                    # 新增预处理封装
+                    def prepare_image(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                        if len(image.shape) == 3:
+                            if image.shape[2] == 3:
+                                image_for_display = image.copy()
+                                image_for_seg = image[:, :, 0]
+                            elif image.shape[2] == 1:
+                                image_for_display = image[:, :, 0]
+                                image_for_seg = image[:, :, 0]
+                            else:
+                                image_for_display = image[:, :, 0]
+                                image_for_seg = image[:, :, 0]
+                        elif len(image.shape) == 2:
+                            image_for_display = image
+                            image_for_seg = image
+                        else:
+                            raise ValueError(f"Unsupported image shape: {image.shape}")
+                        
+                        if image_for_seg.max() <= 1:
+                            image_for_seg = (image_for_seg * 255).astype(np.uint8)
+                        else:
+                            image_for_seg = image_for_seg.astype(np.uint8)
+                        
+                        # 为 segment_anything 准备 RGB 格式图像
+                        image_for_amg = np.stack([image_for_seg]*3, axis=-1)
+                        return image_for_display, image_for_seg, image_for_amg
+                    
+                    image_for_display, image_for_seg, image_for_amg = prepare_image(image)
+                    print(f"  Debug: Final image_for_seg shape: {image_for_seg.shape}, dtype: {image_for_seg.dtype}")
+                except Exception as img_error:
+                    print(f"Error loading image {img_path}: {img_error}")
+                    continue
                 
-                # 预测
+                # 预测 - 使用示例代码的方式
                 if segmenter is not None:
+                    # 如果有专门的segmenter，使用它
                     if hasattr(segmenter, 'initialize') and hasattr(segmenter, 'generate'):
                         segmenter.initialize(image_for_seg)
                         masks = segmenter.generate()
@@ -651,18 +708,87 @@ def process_test_samples_worker(args):
                             ndim=2
                         )
                 else:
-                    from micro_sam.instance_segmentation import AutomaticMaskGenerator, mask_data_to_segmentation
-                    amg = AutomaticMaskGenerator(predictor)
-                    amg.initialize(image_for_seg)
-                    masks = amg.generate()
-                    segmentation = mask_data_to_segmentation(
-                        masks, with_background=True, min_object_size=0
-                    )
+                    # 使用AutomaticMaskGenerator（仿照示例代码）
+                    try:
+                        # 需要获取sam_model，这里需要重新加载
+                        if hasattr(predictor, 'model'):
+                            sam_model = predictor.model
+                        else:
+                            # 重新获取sam_model
+                            _, sam_model = get_sam_model(
+                                model_type=model_config["model_type"], 
+                                device=device, 
+                                return_sam=True
+                            )
+                            
+                            # 如果有checkpoint，再次应用LoRA权重
+                            if checkpoint_path and Path(checkpoint_path).exists():
+                                state = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                                peft_state = state.get('model', state.get('sam', state.get('state_dict', state)))
+                                sam_model.load_state_dict(peft_state, strict=False)
+                                sam_model.eval()
+                        
+                        # 创建AMG（使用示例代码的参数）
+                        amg = SamAutomaticMaskGenerator(
+                            sam_model,
+                            points_per_side=32,
+                            pred_iou_thresh=0.86,
+                            stability_score_thresh=0.92,
+                            crop_n_layers=0
+                        )
+                        masks = amg.generate(image_for_amg)
+                        # amg = AutomaticMaskGenerator(predictor)
+                        # amg.initialize(image_for_seg)
+                        # masks = amg.generate()
+
+                        segmentation = mask_data_to_segmentation(
+                            masks, with_background=True, min_object_size=0
+)
+                        
+                        # 转换为segmentation格式
+                        if masks:
+                            # 创建实例分割图
+                            height, width = image_for_seg.shape[:2]
+                            segmentation = np.zeros((height, width), dtype=np.uint16)
+                            
+                            # 按面积排序，大的先画
+                            sorted_masks = sorted(masks, key=lambda x: x['area'], reverse=True)
+                            
+                            for idx, mask_data in enumerate(sorted_masks, 1):
+                                mask = mask_data['segmentation']
+                                segmentation[mask] = idx
+                        else:
+                            segmentation = np.zeros_like(image_for_seg, dtype=np.uint16)
+                            
+                    except ImportError:
+                        print("  Warning: segment_anything not available, using micro_sam AMG")
+                        # 使用micro_sam的AMG作为备选
+                        from micro_sam.instance_segmentation import AutomaticMaskGenerator, mask_data_to_segmentation
+                        amg = AutomaticMaskGenerator(predictor)
+                        amg.initialize(image_for_seg)
+                        masks = amg.generate()
+                        segmentation = mask_data_to_segmentation(
+                            masks, with_background=True, min_object_size=0
+                        )
                 
-                # 加载GT
-                gt_mask = io.imread(mask_path)
-                if len(gt_mask.shape) > 2:
-                    gt_mask = gt_mask[:, :, 0]
+                # 加载GT - 增强错误处理
+                try:
+                    gt_mask = io.imread(mask_path)
+                    print(f"  Debug: GT mask {sample_id} shape: {gt_mask.shape}, dtype: {gt_mask.dtype}")
+                    
+                    if len(gt_mask.shape) > 2:
+                        gt_mask = gt_mask[:, :, 0]
+                    
+                    # 确保GT mask是2D的
+                    if len(gt_mask.shape) != 2:
+                        print(f"Error: GT mask still not 2D: {gt_mask.shape}")
+                        continue
+                        
+                    print(f"  Debug: Final GT mask shape: {gt_mask.shape}")
+                    
+                except Exception as gt_error:
+                    print(f"Error loading GT mask {mask_path}: {gt_error}")
+                    continue
                 
                 processing_time = time.time() - start_time
                 total_processing_time += processing_time

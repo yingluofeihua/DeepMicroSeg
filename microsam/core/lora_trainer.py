@@ -1,7 +1,6 @@
 """
-LoRA训练器 (修改版)
-负责LoRA模型的训练、验证和保存
-使用新的SAM模型加载架构
+LoRA训练器 - 完整多实例版本
+支持SAM的多实例细胞分割训练
 """
 
 import torch
@@ -20,14 +19,21 @@ import wandb
 from config.lora_config import LoRATrainingSettings
 from lora.sam_lora_wrapper import SAMLoRAWrapper, create_sam_lora_model
 from lora.data_loaders import create_data_loaders
-from lora.training_utils import SAMLoss, prepare_sam_inputs, TrainingMetrics, create_sam_training_step
+from lora.training_utils import (
+    SAMLoss, prepare_sam_inputs, TrainingMetrics,
+    # 🔧 新增多实例相关函数
+    SAMLossMultiInstance, 
+    prepare_sam_inputs_multi_instance,
+    create_sam_training_step_multi_instance,
+    validate_sam_batch_multi_instance
+)
 from core.metrics import ComprehensiveMetrics, MetricsResult
 from utils.file_utils import setup_logging
 from utils.model_utils import optimize_memory, get_device_info, print_model_summary
 
 
 class LoRATrainer:
-    """LoRA训练器 - 使用新的SAM架构"""
+    """LoRA训练器 - 支持多实例SAM细胞分割"""
     
     def __init__(self, config: LoRATrainingSettings):
         self.config = config
@@ -46,6 +52,10 @@ class LoRATrainer:
         self.global_step = 0
         self.best_metric = float('inf')
         self.early_stopping_counter = 0
+        
+        # 🔧 多实例训练相关
+        self.use_multi_instance = True  # 启用多实例训练
+        self.training_step_fn = None
         
         # 日志和监控
         self.writer = None
@@ -79,12 +89,10 @@ class LoRATrainer:
         
         return device
     
-    # 在 core/lora_trainer.py 中添加设备一致性检查
-
     def setup_model(self) -> bool:
-        """设置SAM LoRA模型 - 修复设备一致性"""
+        """设置SAM LoRA模型 - 支持多实例"""
         try:
-            print("正在设置SAM LoRA模型...")
+            print("正在设置SAM LoRA多实例模型...")
             
             # 创建LoRA配置
             lora_config = {
@@ -109,10 +117,10 @@ class LoRATrainer:
                 print("SAM LoRA模型创建失败")
                 return False
             
-            # 🔧 确保模型在正确设备上
+            # 确保模型在正确设备上
             self.model = self.model.to(self.device)
             
-            # 🔧 确保所有LoRA模块在正确设备上
+            # 确保所有LoRA模块在正确设备上
             if hasattr(self.model, 'lora_modules'):
                 for name, lora_module in self.model.lora_modules.items():
                     if hasattr(lora_module, 'lora'):
@@ -123,7 +131,7 @@ class LoRATrainer:
             self.model.print_model_info()
             print_model_summary(self.model)
             
-            # 🔧 验证模型设备一致性
+            # 验证模型设备一致性
             self._verify_model_device_consistency()
             
             return True
@@ -163,25 +171,35 @@ class LoRATrainer:
         
         if len(device_counts) > 1:
             print(f"⚠️  发现多个设备，正在统一到 {self.device}")
-            # 强制移动所有组件
             self.model = self.model.to(self.device)
             print(f"✅ 所有模型组件已移动到 {self.device}")
         else:
             print(f"✅ 所有模型组件都在 {self.device} 上")
     
     def setup_data_loaders(self) -> bool:
-        """设置数据加载器"""
+        """设置数据加载器 - 支持多实例"""
         try:
-            print("正在创建数据加载器...")
+            print("正在创建多实例数据加载器...")
             
+            # 🔧 使用SAM数据集格式，支持多实例
             self.data_loaders = create_data_loaders(
                 config=self.config.data,
                 dataset_type="sam"  # 使用SAM数据集格式
             )
             
-            print("数据加载器创建成功:")
+            print("多实例数据加载器创建成功:")
             for split, loader in self.data_loaders.items():
                 print(f"  {split}: {len(loader)} 批次, {len(loader.dataset)} 样本")
+                
+                # 🔧 验证第一个批次的数据格式
+                if len(loader) > 0:
+                    try:
+                        first_batch = next(iter(loader))
+                        print(f"    - 图像形状: {first_batch['images'].shape}")
+                        print(f"    - 掩码形状: {first_batch['ground_truth_masks'].shape}")
+                        print(f"    - 最大实例数: {first_batch['ground_truth_masks'].shape[1]}")
+                    except Exception as e:
+                        print(f"    - 批次验证失败: {e}")
             
             return True
             
@@ -192,7 +210,7 @@ class LoRATrainer:
             return False
     
     def setup_optimizer_and_loss(self):
-        """设置优化器和损失函数"""
+        """设置优化器和损失函数 - 多实例版本"""
         # 只优化LoRA参数
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
@@ -232,16 +250,32 @@ class LoRATrainer:
         else:
             self.scheduler = None
         
-        # 创建损失函数
-        loss_config = {
-            'focal_loss_weight': 20.0,
-            'dice_loss_weight': 1.0,
-            'iou_loss_weight': 1.0,
-            'use_focal_loss': True,
-            'use_dice_loss': True,
-            'use_iou_loss': True
-        }
-        self.loss_fn = SAMLoss(**loss_config)
+        # 🔧 创建多实例损失函数
+        if self.use_multi_instance:
+            loss_config = {
+                'focal_loss_weight': 20.0,
+                'dice_loss_weight': 1.0,
+                'iou_loss_weight': 1.0,
+                'instance_loss_weight': 5.0,
+                'use_focal_loss': True,
+                'use_dice_loss': True,
+                'use_iou_loss': True,
+                'use_instance_loss': True
+            }
+            self.loss_fn = SAMLossMultiInstance(**loss_config)
+            print("使用多实例SAM损失函数")
+        else:
+            # 传统单实例损失函数
+            loss_config = {
+                'focal_loss_weight': 20.0,
+                'dice_loss_weight': 1.0,
+                'iou_loss_weight': 1.0,
+                'use_focal_loss': True,
+                'use_dice_loss': True,
+                'use_iou_loss': True
+            }
+            self.loss_fn = SAMLoss(**loss_config)
+            print("使用传统SAM损失函数")
         
         print(f"优化器设置完成: {type(self.optimizer).__name__}")
         print(f"学习率调度器: {type(self.scheduler).__name__ if self.scheduler else 'None'}")
@@ -263,9 +297,9 @@ class LoRATrainer:
             )
     
     def train(self) -> bool:
-        """开始训练"""
+        """开始训练 - 多实例版本"""
         print("="*60)
-        print("开始SAM LoRA训练")
+        print("开始SAM LoRA多实例微调训练")
         print("="*60)
         
         # 设置所有组件
@@ -278,10 +312,19 @@ class LoRATrainer:
         self.setup_optimizer_and_loss()
         self.setup_logging()
         
-        # 创建训练步骤函数
-        training_step_fn = create_sam_training_step(
-            self.model, self.optimizer, self.loss_fn, self.device
-        )
+        # 🔧 创建多实例训练步骤函数
+        if self.use_multi_instance:
+            self.training_step_fn = create_sam_training_step_multi_instance(
+                self.model, self.optimizer, self.loss_fn, self.device
+            )
+            print("使用多实例训练步骤函数")
+        else:
+            # 使用传统训练步骤
+            from lora.training_utils import create_sam_training_step
+            self.training_step_fn = create_sam_training_step(
+                self.model, self.optimizer, self.loss_fn, self.device
+            )
+            print("使用传统训练步骤函数")
         
         # 训练循环
         try:
@@ -290,11 +333,17 @@ class LoRATrainer:
                 
                 print(f"\n开始第 {epoch + 1}/{self.config.training.num_epochs} 轮训练")
                 
-                # 训练一个epoch
-                train_metrics = self.train_epoch(training_step_fn)
+                # 🔧 使用对应的训练函数
+                if self.use_multi_instance:
+                    train_metrics = self.train_epoch_multi_instance()
+                else:
+                    train_metrics = self.train_epoch()
                 
                 # 验证
-                val_metrics = self.validate() if 'val' in self.data_loaders else {}
+                if self.use_multi_instance:
+                    val_metrics = self.validate_multi_instance() if 'val' in self.data_loaders else {}
+                else:
+                    val_metrics = self.validate() if 'val' in self.data_loaders else {}
 
                 # 记录日志
                 self.log_metrics(train_metrics, val_metrics, epoch)
@@ -319,7 +368,7 @@ class LoRATrainer:
             self.save_final_model()
             
             print("\n" + "="*60)
-            print("训练完成!")
+            print("多实例训练完成!")
             print("="*60)
             return True
             
@@ -335,8 +384,72 @@ class LoRATrainer:
             if self.config.experiment.use_wandb:
                 wandb.finish()
     
-    def train_epoch(self, training_step_fn) -> Dict[str, float]:
-        """训练一个epoch"""
+    def train_epoch_multi_instance(self) -> Dict[str, float]:
+        """多实例训练一个epoch"""
+        self.model.train()
+        
+        epoch_metrics = TrainingMetrics()
+        
+        progress_bar = tqdm(
+            self.data_loaders['train'],
+            desc=f"Epoch {self.current_epoch + 1}/{self.config.training.num_epochs}"
+        )
+        
+        successful_steps = 0
+        failed_steps = 0
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            try:
+                # 🔧 使用多实例训练步骤函数
+                step_metrics = self.training_step_fn(batch)
+                
+                # 检查训练结果
+                if 'error' not in step_metrics:
+                    epoch_metrics.update(step_metrics)
+                    self.global_step += 1
+                    successful_steps += 1
+                    
+                    # 更新进度条
+                    progress_bar.set_postfix({
+                        'loss': f"{step_metrics.get('total_loss', 0):.4f}",
+                        'focal': f"{step_metrics.get('focal_loss', 0):.4f}",
+                        'dice': f"{step_metrics.get('dice_loss', 0):.4f}",
+                        'instance': f"{step_metrics.get('instance_loss', 0):.4f}",
+                        'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                        'success': f"{successful_steps}/{successful_steps + failed_steps}"
+                    })
+                    
+                    # 记录步骤日志
+                    if self.global_step % self.config.training.logging_steps == 0:
+                        self.log_step_metrics(step_metrics, batch_idx)
+                else:
+                    failed_steps += 1
+                    error_type = step_metrics.get('error_type', 'unknown')
+                    print(f"批次 {batch_idx} 处理失败: {error_type}")
+                    
+                    # 如果失败率过高，停止训练
+                    if failed_steps > successful_steps and batch_idx > 10:
+                        print(f"失败率过高 ({failed_steps}/{successful_steps + failed_steps})，停止训练")
+                        break
+                
+            except Exception as e:
+                print(f"训练步骤异常 (批次 {batch_idx}): {e}")
+                failed_steps += 1
+                continue
+        
+        # 计算epoch平均指标
+        avg_metrics = epoch_metrics.compute()
+        avg_metrics['learning_rate'] = self.optimizer.param_groups[0]['lr']
+        avg_metrics['successful_steps'] = successful_steps
+        avg_metrics['failed_steps'] = failed_steps
+        avg_metrics['success_rate'] = successful_steps / (successful_steps + failed_steps) if (successful_steps + failed_steps) > 0 else 0
+        
+        print(f"Epoch完成: 成功 {successful_steps}, 失败 {failed_steps}, 成功率 {avg_metrics['success_rate']:.2%}")
+        
+        return avg_metrics
+    
+    def train_epoch(self) -> Dict[str, float]:
+        """传统训练一个epoch（单实例）"""
         self.model.train()
         
         epoch_metrics = TrainingMetrics()
@@ -347,30 +460,30 @@ class LoRATrainer:
         )
         
         for batch_idx, batch in enumerate(progress_bar):
-            # try:
-            # 执行训练步骤
-            step_metrics = training_step_fn(batch)
-            
-            # 更新统计
-            if 'error' not in step_metrics:
-                epoch_metrics.update(step_metrics)
-                self.global_step += 1
+            try:
+                # 执行训练步骤
+                step_metrics = self.training_step_fn(batch)
                 
-                # 更新进度条
-                progress_bar.set_postfix({
-                    'loss': f"{step_metrics.get('total_loss', 0):.4f}",
-                    'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
-                })
-                
-                # 记录步骤日志
-                if self.global_step % self.config.training.logging_steps == 0:
-                    self.log_step_metrics(step_metrics, batch_idx)
-            else:
-                print(f"批次 {batch_idx} 处理失败")
-                
-            # except Exception as e:
-            #     print(f"训练步骤失败 (批次 {batch_idx}): {e}")
-            #     continue
+                # 更新统计
+                if 'error' not in step_metrics:
+                    epoch_metrics.update(step_metrics)
+                    self.global_step += 1
+                    
+                    # 更新进度条
+                    progress_bar.set_postfix({
+                        'loss': f"{step_metrics.get('total_loss', 0):.4f}",
+                        'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                    })
+                    
+                    # 记录步骤日志
+                    if self.global_step % self.config.training.logging_steps == 0:
+                        self.log_step_metrics(step_metrics, batch_idx)
+                else:
+                    print(f"批次 {batch_idx} 处理失败")
+                    
+            except Exception as e:
+                print(f"训练步骤失败 (批次 {batch_idx}): {e}")
+                continue
         
         # 计算epoch平均指标
         avg_metrics = epoch_metrics.compute()
@@ -378,8 +491,86 @@ class LoRATrainer:
         
         return avg_metrics
     
+    def validate_multi_instance(self) -> Dict[str, float]:
+        """多实例验证模型"""
+        if 'val' not in self.data_loaders:
+            return {}
+        
+        print("正在进行多实例验证...")
+        self.model.eval()
+        
+        val_metrics = TrainingMetrics()
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(self.data_loaders['val'], desc="Validating")):
+                try:
+                    # 🔧 使用多实例输入准备
+                    inputs, targets = prepare_sam_inputs_multi_instance(batch)
+                    
+                    # 将数据移动到设备
+                    for key, value in inputs.items():
+                        if isinstance(value, torch.Tensor):
+                            inputs[key] = value.to(self.device)
+                        elif isinstance(value, list):
+                            inputs[key] = [v.to(self.device) if isinstance(v, torch.Tensor) else v for v in value]
+                    
+                    for key, value in targets.items():
+                        if isinstance(value, torch.Tensor):
+                            targets[key] = value.to(self.device)
+                    
+                    # 前向传播
+                    predictions = self.model(inputs)
+                    
+                    # 计算损失
+                    loss_dict = self.loss_fn(predictions, targets)
+                    val_metrics.update(loss_dict)
+                    
+                    # 🔧 处理多实例预测和目标用于指标计算
+                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()  # [B, N_pred, H, W]
+                    target_masks = targets['masks'].cpu().numpy()  # [B, N_target, H, W]
+                    
+                    # 为每个样本选择最佳预测和合并目标
+                    for i in range(pred_masks.shape[0]):
+                        # 选择IoU得分最高的预测掩码
+                        if pred_masks.shape[1] > 1 and 'iou_predictions' in predictions:
+                            iou_scores = predictions['iou_predictions'][i].cpu().numpy()
+                            best_pred_idx = np.argmax(iou_scores)
+                            pred_mask = pred_masks[i, best_pred_idx]
+                        else:
+                            pred_mask = pred_masks[i, 0] if pred_masks.shape[1] > 0 else np.zeros_like(target_masks[i, 0])
+                        
+                        # 合并所有目标实例（用于整体评估）
+                        target_combined = (target_masks[i].sum(axis=0) > 0).astype(np.float32)
+                        
+                        all_predictions.append(pred_mask)
+                        all_targets.append(target_combined)
+                    
+                    # 限制验证批次数量
+                    if batch_idx >= 10:
+                        break
+                        
+                except Exception as e:
+                    print(f"验证步骤失败: {e}")
+                    continue
+        
+        # 计算平均损失
+        avg_val_metrics = val_metrics.compute()
+        
+        # 计算分割指标
+        if all_predictions and all_targets:
+            print(f"计算分割指标，样本数量={len(all_predictions)}")
+            seg_metrics = self._compute_segmentation_metrics_multi_instance(all_predictions, all_targets)
+            avg_val_metrics.update(seg_metrics)
+        else:
+            print("没有有效的预测/目标数据")
+            avg_val_metrics.update({'val_iou': 0.0, 'val_dice': 0.0})
+        
+        return avg_val_metrics
+    
     def validate(self) -> Dict[str, float]:
-        """验证模型 - 修复尺寸不匹配"""
+        """传统验证模型（单实例）"""
         if 'val' not in self.data_loaders:
             return {}
         
@@ -401,7 +592,7 @@ class LoRATrainer:
                         if isinstance(value, torch.Tensor):
                             inputs[key] = value.to(self.device)
                         elif isinstance(value, list):
-                            inputs[key] = [v.to(self.device) if isinstance(v, torch.Tensor) else v for v in value]
+                            inputs[key] = [v.to(device) if isinstance(v, torch.Tensor) else v for v in value]
                     
                     for key, value in targets.items():
                         if isinstance(value, torch.Tensor):
@@ -414,29 +605,19 @@ class LoRATrainer:
                     loss_dict = self.loss_fn(predictions, targets)
                     val_metrics.update(loss_dict)
                     
-                    # 🔧 修复：收集原始尺寸的预测和目标用于指标计算
-                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()  # [B, 1, 256, 256]
+                    # 收集预测和目标
+                    pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
+                    target_masks = targets['masks'].cpu().numpy()
                     
-                    # 获取原始尺寸的目标掩码
-                    original_targets = batch['ground_truth_masks'].cpu().numpy()  # [B, N, 1024, 1024]
-                    
-                    # 合并多实例目标为二进制掩码
-                    if original_targets.shape[1] > 1:
-                        # 将多实例合并为二进制掩码
-                        target_masks = (original_targets.sum(axis=1, keepdims=True) > 0).astype(np.float32)
-                    else:
-                        target_masks = original_targets
-                    
-                    # 移除批次维度并添加到列表
                     for i in range(pred_masks.shape[0]):
-                        pred_mask = pred_masks[i]  # [1, 256, 256]
-                        target_mask = target_masks[i]  # [1, 1024, 1024]
+                        pred_mask = pred_masks[i]
+                        target_mask = target_masks[i]
                         
                         all_predictions.append(pred_mask)
                         all_targets.append(target_mask)
                     
-                    # 只处理前几个批次用于验证（避免内存问题）
-                    if batch_idx >= 5:  # 限制验证数量
+                    # 只处理前几个批次用于验证
+                    if batch_idx >= 5:
                         break
                         
                 except Exception as e:
@@ -448,17 +629,15 @@ class LoRATrainer:
         
         # 计算分割指标
         if all_predictions and all_targets:
-            print(f"DEBUG: 计算分割指标，预测数量={len(all_predictions)}, 目标数量={len(all_targets)}")
             seg_metrics = self._compute_segmentation_metrics(all_predictions, all_targets)
             avg_val_metrics.update(seg_metrics)
         else:
-            print("DEBUG: 没有有效的预测/目标数据")
             avg_val_metrics.update({'val_iou': 0.0, 'val_dice': 0.0})
         
         return avg_val_metrics
     
-    def _compute_segmentation_metrics(self, predictions: List, targets: List) -> Dict[str, float]:
-        """计算分割指标 - 修复尺寸不匹配问题"""
+    def _compute_segmentation_metrics_multi_instance(self, predictions: List, targets: List) -> Dict[str, float]:
+        """计算多实例分割指标"""
         try:
             all_ious = []
             all_dices = []
@@ -466,26 +645,76 @@ class LoRATrainer:
             for pred, target in zip(predictions, targets):
                 # 处理维度
                 if pred.ndim > 2:
-                    pred = pred[0] if pred.shape[0] == 1 else pred.mean(axis=0)  # 取第一个通道或平均
+                    pred = pred[0] if pred.shape[0] == 1 else pred.mean(axis=0)
                 if target.ndim > 2:
                     target = target[0] if target.shape[0] == 1 else target.mean(axis=0)
                 
-                # 🔧 关键修复：调整尺寸匹配
+                # 二值化
+                pred_binary = (pred > 0.5).astype(np.int32)
+                target_binary = (target > 0.5).astype(np.int32)
+                
+                # 计算IoU和Dice
+                intersection = np.sum(pred_binary * target_binary)
+                pred_sum = np.sum(pred_binary)
+                target_sum = np.sum(target_binary)
+                union = pred_sum + target_sum - intersection
+                
+                if union > 0:
+                    iou = intersection / union
+                    dice = 2 * intersection / (pred_sum + target_sum)
+                    all_ious.append(iou)
+                    all_dices.append(dice)
+                else:
+                    # 如果都是空的，认为完全匹配
+                    if pred_sum == 0 and target_sum == 0:
+                        all_ious.append(1.0)
+                        all_dices.append(1.0)
+                    else:
+                        all_ious.append(0.0)
+                        all_dices.append(0.0)
+            
+            avg_iou = np.mean(all_ious) if all_ious else 0.0
+            avg_dice = np.mean(all_dices) if all_dices else 0.0
+            
+            print(f"多实例验证完成，平均IoU={avg_iou:.4f}, 平均Dice={avg_dice:.4f}")
+            
+            return {
+                'val_iou': avg_iou,
+                'val_dice': avg_dice,
+                'val_samples': len(all_ious)
+            }
+            
+        except Exception as e:
+            print(f"多实例分割指标计算失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'val_iou': 0.0, 'val_dice': 0.0}
+    
+    def _compute_segmentation_metrics(self, predictions: List, targets: List) -> Dict[str, float]:
+        """计算分割指标（传统版本）"""
+        try:
+            all_ious = []
+            all_dices = []
+            
+            for pred, target in zip(predictions, targets):
+                # 处理维度
+                if pred.ndim > 2:
+                    pred = pred[0] if pred.shape[0] == 1 else pred.mean(axis=0)
+                if target.ndim > 2:
+                    target = target[0] if target.shape[0] == 1 else target.mean(axis=0)
+                
+                # 尺寸匹配
                 if pred.shape != target.shape:
-                    print(f"DEBUG: 调整预测掩码尺寸从 {pred.shape} 到 {target.shape}")
-                    
-                    # 使用最近邻插值调整预测掩码尺寸
                     import torch.nn.functional as F
                     import torch
                     
-                    pred_tensor = torch.from_numpy(pred).unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
+                    pred_tensor = torch.from_numpy(pred).unsqueeze(0).unsqueeze(0).float()
                     target_size = target.shape
                     
-                    # 调整到目标尺寸
                     pred_resized = F.interpolate(
                         pred_tensor, 
                         size=target_size, 
-                        mode='bilinear',  # 使用双线性插值获得更好效果
+                        mode='bilinear',
                         align_corners=False
                     )
                     pred = pred_resized.squeeze().numpy()
@@ -504,20 +733,14 @@ class LoRATrainer:
                     
                     all_ious.append(iou)
                     all_dices.append(dice)
-                    
-                    # 详细调试信息
-                    print(f"DEBUG: pred_shape={pred_binary.shape}, target_shape={target_binary.shape}")
-                    print(f"DEBUG: intersection={intersection}, union={union}, IoU={iou:.4f}, Dice={dice:.4f}")
                 else:
-                    # 如果没有预测和真实目标，IoU和Dice都是0
                     all_ious.append(0.0)
                     all_dices.append(0.0)
-                    print(f"DEBUG: 空预测或空目标，IoU=0, Dice=0")
             
             avg_iou = np.mean(all_ious) if all_ious else 0.0
             avg_dice = np.mean(all_dices) if all_dices else 0.0
             
-            print(f"DEBUG: 验证完成，平均IoU={avg_iou:.4f}, 平均Dice={avg_dice:.4f}")
+            print(f"验证完成，平均IoU={avg_iou:.4f}, 平均Dice={avg_dice:.4f}")
             
             return {
                 'val_iou': avg_iou,
@@ -552,7 +775,12 @@ class LoRATrainer:
         print(f"\nEpoch {epoch + 1}/{self.config.training.num_epochs} - 指标摘要:")
         print("训练指标:")
         for key, value in train_metrics.items():
-            print(f"  {key}: {value:.4f}")
+            if key in ['successful_steps', 'failed_steps']:
+                print(f"  {key}: {int(value)}")
+            elif key == 'success_rate':
+                print(f"  {key}: {value:.2%}")
+            else:
+                print(f"  {key}: {value:.4f}")
         
         if val_metrics:
             print("验证指标:")
@@ -563,10 +791,12 @@ class LoRATrainer:
         """记录步骤指标"""
         if self.writer:
             for key, value in step_metrics.items():
-                self.writer.add_scalar(f'train/step_{key}', value, self.global_step)
+                if key not in ['error', 'success']:
+                    self.writer.add_scalar(f'train/step_{key}', value, self.global_step)
         
         if self.config.experiment.use_wandb:
-            log_dict = {f'train/step_{k}': v for k, v in step_metrics.items()}
+            log_dict = {f'train/step_{k}': v for k, v in step_metrics.items() 
+                       if k not in ['error', 'success']}
             log_dict['global_step'] = self.global_step
             wandb.log(log_dict)
     
@@ -583,7 +813,8 @@ class LoRATrainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_metric': self.best_metric,
             'config': self.config.to_dict(),
-            'metrics': metrics
+            'metrics': metrics,
+            'use_multi_instance': self.use_multi_instance
         }
         
         # 保存当前检查点
@@ -635,6 +866,7 @@ class LoRATrainer:
             'total_steps': self.global_step,
             'best_metric': self.best_metric,
             'model_type': self.config.model.base_model_name,
+            'use_multi_instance': self.use_multi_instance,
             'lora_config': {
                 'rank': self.config.lora.rank,
                 'alpha': self.config.lora.alpha,
@@ -663,8 +895,13 @@ class LoRATrainer:
             self.global_step = checkpoint['global_step']
             self.best_metric = checkpoint['best_metric']
             
+            # 恢复多实例设置
+            if 'use_multi_instance' in checkpoint:
+                self.use_multi_instance = checkpoint['use_multi_instance']
+            
             print(f"检查点加载成功: {checkpoint_path}")
             print(f"从第 {self.current_epoch + 1} 轮继续训练")
+            print(f"使用多实例模式: {self.use_multi_instance}")
             
             return True
             
@@ -691,8 +928,11 @@ class LoRATrainer:
         with torch.no_grad():
             for batch in tqdm(test_data_loader, desc="Evaluating"):
                 try:
-                    # 准备输入和目标
-                    inputs, targets = prepare_sam_inputs(batch)
+                    # 根据模式选择输入准备函数
+                    if self.use_multi_instance:
+                        inputs, targets = prepare_sam_inputs_multi_instance(batch)
+                    else:
+                        inputs, targets = prepare_sam_inputs(batch)
                     
                     # 将数据移动到设备
                     for key, value in inputs.items():
@@ -716,8 +956,23 @@ class LoRATrainer:
                     pred_masks = torch.sigmoid(predictions['masks']).cpu().numpy()
                     target_masks = targets['masks'].cpu().numpy()
                     
-                    all_predictions.extend(pred_masks)
-                    all_targets.extend(target_masks)
+                    if self.use_multi_instance:
+                        # 多实例处理
+                        for i in range(pred_masks.shape[0]):
+                            if pred_masks.shape[1] > 1 and 'iou_predictions' in predictions:
+                                iou_scores = predictions['iou_predictions'][i].cpu().numpy()
+                                best_pred_idx = np.argmax(iou_scores)
+                                pred_mask = pred_masks[i, best_pred_idx]
+                            else:
+                                pred_mask = pred_masks[i, 0] if pred_masks.shape[1] > 0 else np.zeros_like(target_masks[i, 0])
+                            
+                            target_combined = (target_masks[i].sum(axis=0) > 0).astype(np.float32)
+                            all_predictions.append(pred_mask)
+                            all_targets.append(target_combined)
+                    else:
+                        # 单实例处理
+                        all_predictions.extend(pred_masks)
+                        all_targets.extend(target_masks)
                     
                 except Exception as e:
                     print(f"评估步骤失败: {e}")
@@ -728,7 +983,10 @@ class LoRATrainer:
         
         # 计算分割指标
         if all_predictions and all_targets:
-            seg_metrics = self._compute_segmentation_metrics(all_predictions, all_targets)
+            if self.use_multi_instance:
+                seg_metrics = self._compute_segmentation_metrics_multi_instance(all_predictions, all_targets)
+            else:
+                seg_metrics = self._compute_segmentation_metrics(all_predictions, all_targets)
             final_metrics.update(seg_metrics)
         
         print("评估完成:")
@@ -761,3 +1019,69 @@ def resume_training(checkpoint_path: str, config_path: Optional[str] = None) -> 
     
     trainer.load_checkpoint(checkpoint_path)
     return trainer
+
+
+def create_multi_instance_trainer(data_dir: str, 
+                                model_type: str = "vit_b_lm",
+                                batch_size: int = 4,
+                                epochs: int = 15,
+                                learning_rate: float = 1e-4,
+                                rank: int = 8,
+                                output_dir: str = "./multi_instance_experiments") -> LoRATrainer:
+    """快速创建多实例训练器"""
+    
+    from config.lora_config import LoRATrainingSettings
+    
+    config = LoRATrainingSettings()
+    
+    # 数据配置
+    config.data.train_data_dir = data_dir
+    config.data.batch_size = batch_size
+    config.data.max_objects_per_image = 20
+    config.data.use_data_augmentation = True
+    
+    # 模型配置
+    config.model.base_model_name = model_type
+    config.model.apply_lora_to = ['image_encoder']
+    
+    # LoRA配置
+    config.lora.rank = rank
+    config.lora.alpha = rank * 2.0
+    config.lora.dropout = 0.1
+    
+    # 训练配置
+    config.training.num_epochs = epochs
+    config.training.learning_rate = learning_rate
+    config.training.batch_size = batch_size
+    config.training.save_steps = 200
+    config.training.eval_steps = 50
+    config.training.logging_steps = 10
+    
+    # 实验配置
+    config.experiment.output_dir = output_dir
+    config.experiment.experiment_name = f"multi_instance_{model_type}_r{rank}"
+    
+    trainer = LoRATrainer(config)
+    trainer.use_multi_instance = True  # 确保启用多实例
+    
+    return trainer
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 创建多实例训练器并开始训练
+    trainer = create_multi_instance_trainer(
+        data_dir="/path/to/your/cell/data",
+        model_type="vit_b_lm",
+        batch_size=4,
+        epochs=15,
+        learning_rate=1e-4,
+        rank=8
+    )
+    
+    success = trainer.train()
+    
+    if success:
+        print("🎉 多实例SAM LoRA训练成功完成!")
+    else:
+        print("❌ 训练失败")

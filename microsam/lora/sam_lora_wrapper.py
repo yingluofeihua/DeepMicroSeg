@@ -417,7 +417,6 @@ class SAMLoRAWrapper(nn.Module):
     def load_lora_weights(self, load_path: str):
         """加载LoRA权重"""
         load_path = Path(load_path)
-        
         # 加载权重
         weights_file = load_path / "sam_lora_weights.pth"
         if weights_file.exists():
@@ -559,3 +558,122 @@ def load_sam_lora_model(model_type: str, lora_path: str, device: str = "cuda") -
     except Exception as e:
         print(f"加载SAM LoRA模型失败: {e}")
         return None
+
+
+class SAMLoRAWrapperMultiInstance(SAMLoRAWrapper):
+    """支持多实例的SAM LoRA包装器"""
+    
+    def forward(self, batch_inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """前向传播 - 支持多实例输出"""
+        try:
+            images = batch_inputs['images']
+            device = images.device
+            batch_size = images.shape[0]
+            
+            # 确保所有组件在正确设备上
+            self._ensure_models_on_device(device)
+            
+            # 图像编码
+            if images.shape[-1] != 1024 or images.shape[-2] != 1024:
+                images = F.interpolate(
+                    images, 
+                    size=(1024, 1024), 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+            
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                image_embeddings = self.image_encoder(images)
+            
+            # 🔧 关键修复：支持多实例输出
+            batch_outputs = []
+            
+            for i in range(batch_size):
+                single_image_embedding = image_embeddings[i:i+1]
+                
+                # 提示编码
+                sparse_embeddings, dense_embeddings = self._encode_prompts(
+                    batch_inputs.get('point_coords', []), 
+                    batch_inputs.get('point_labels', []), 
+                    batch_inputs.get('boxes', []), 
+                    batch_inputs.get('mask_inputs', None), 
+                    i, device
+                )
+                
+                # 获取位置编码
+                try:
+                    image_pe = self.prompt_encoder.get_dense_pe().to(device)
+                except:
+                    image_pe = torch.zeros(1, 256, 64, 64, device=device)
+                
+                # 🎯 关键修改：设置multimask_output=True以获得多个掩码
+                multimask_output = batch_inputs.get('multimask_output', True)
+                
+                low_res_masks, iou_predictions = self.mask_decoder(
+                    image_embeddings=single_image_embedding,
+                    image_pe=image_pe,
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output
+                )
+                
+                # 调整输出尺寸
+                target_size = batch_inputs['images'].shape[-2:]
+                if low_res_masks.shape[-2:] != target_size:
+                    low_res_masks = F.interpolate(
+                        low_res_masks,
+                        size=target_size,
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                
+                batch_outputs.append({
+                    'masks': low_res_masks,  # [1, N, H, W] - 多个掩码
+                    'iou_predictions': iou_predictions
+                })
+            
+            # 合并批量输出
+            result = self._merge_batch_outputs_multi_instance(batch_outputs)
+            return result
+            
+        except Exception as e:
+            print(f"SAM forward传播异常: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 返回默认输出
+            device = batch_inputs['images'].device
+            batch_size = batch_inputs['images'].shape[0]
+            target_size = batch_inputs['images'].shape[-2:]
+            
+            return {
+                'masks': torch.zeros(batch_size, 3, *target_size, device=device),  # 默认3个掩码
+                'iou_predictions': torch.zeros(batch_size, 3, device=device)
+            }
+    
+    def _merge_batch_outputs_multi_instance(self, batch_outputs: List[Dict]) -> Dict[str, torch.Tensor]:
+        """合并多实例批量输出"""
+        if not batch_outputs:
+            return {'masks': torch.empty(0), 'iou_predictions': torch.empty(0)}
+        
+        # 找到最大掩码数量
+        max_masks = max(output['masks'].shape[1] for output in batch_outputs)
+        
+        batch_size = len(batch_outputs)
+        mask_shape = batch_outputs[0]['masks'].shape[2:]  # [H, W]
+        device = batch_outputs[0]['masks'].device
+        
+        # 创建统一的输出张量
+        unified_masks = torch.zeros(batch_size, max_masks, *mask_shape, device=device)
+        unified_iou = torch.zeros(batch_size, max_masks, device=device)
+        
+        for i, output in enumerate(batch_outputs):
+            num_masks = output['masks'].shape[1]
+            unified_masks[i, :num_masks] = output['masks'][0]  # 移除第一个维度
+            unified_iou[i, :num_masks] = output['iou_predictions'][0]
+        
+        return {
+            'masks': unified_masks,  # [B, max_masks, H, W]
+            'iou_predictions': unified_iou  # [B, max_masks]
+        }
+

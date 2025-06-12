@@ -142,7 +142,7 @@ def load_test_paths(test_image_dir, test_mask_dir):
     return image_paths, mask_paths
 
 
-class ComprehensiveMetrics:
+class ComprehensiveMetrics(object):
     """Complete evaluation metrics calculator including AP50, AP75, IoU, Dice, HD95"""
     
     @staticmethod

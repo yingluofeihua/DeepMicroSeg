@@ -192,3 +192,10 @@ models/
 documentation/
 local_micro/
 batch_evaluation_results/
+
+microsam/batch_test_lora_293T.sh
+microsam/batch_test_lora_MSC.sh
+microsam/batch_test_lora_RBD.sh
+microsam/batch_train_lora_293T.sh
+microsam/batch_train_lora_MSC.sh
+microsam/batch_train_lora_RBD.sh

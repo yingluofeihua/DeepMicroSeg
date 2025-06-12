@@ -35,7 +35,7 @@ BASE_CONFIG=(
     --val_mask_dir "/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/patch_0520/MSC/val/masks"
     --model_type "vit_b_lm"
     --checkpoint_name "sam_lora_MSC"
-    --pretrained_checkpoint "/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/LDCellData/checkpoint/fl_best.pt"
+    # --pretrained_checkpoint "/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/LDCellData/checkpoint/brightfield_best.pt"
     --rank 8
     --attention_layers_to_update 9 10 11
     --gpu_id 1
@@ -130,13 +130,13 @@ check_prerequisites() {
     done
     
     # 检查预训练检查点
-    local checkpoint="/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/LDCellData/checkpoint/fl_best.pt"
-    if [ ! -f "$checkpoint" ]; then
-        print_error "预训练检查点不存在: $checkpoint"
-        error_count=$((error_count + 1))
-    else
-        print_success "预训练检查点存在: $checkpoint"
-    fi
+    # local checkpoint="/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/LDCellData/checkpoint/brightfield_best.pt"
+    # if [ ! -f "$checkpoint" ]; then
+    #     print_error "预训练检查点不存在: $checkpoint"
+    #     error_count=$((error_count + 1))
+    # else
+    #     print_success "预训练检查点存在: $checkpoint"
+    # fi
     
     # 检查保存目录权限
     if [ ! -w "$(dirname "$BASE_SAVE_ROOT")" ]; then
@@ -184,7 +184,7 @@ wait_for_gpu_memory() {
 # 函数：单个训练任务
 run_single_training() {
     local train_number=$1
-    local save_root="${BASE_SAVE_ROOT}/b_lm_sam_lora_fl_number_${train_number}"
+    local save_root="${BASE_SAVE_ROOT}/b_lm_sam_lora_base_number_${train_number}"
     local log_file="${LOG_DIR}/training_number_${train_number}_$(date +%Y%m%d_%H%M%S).log"
     
     print_info "=========================================="
@@ -310,7 +310,7 @@ main() {
     if [ $success_count -lt $total_count ]; then
         print_warning "以下任务可能需要检查:"
         for train_number in "${TRAIN_NUMBERS[@]}"; do
-            local save_root="${BASE_SAVE_ROOT}/b_lm_sam_lora_fl_number_${train_number}"
+            local save_root="${BASE_SAVE_ROOT}/b_lm_sam_lora_base_number_${train_number}"
             if [ ! -d "${save_root}" ] || [ -z "$(ls -A ${save_root} 2>/dev/null)" ]; then
                 print_warning "  - train_number=${train_number}"
             fi

@@ -37,6 +37,8 @@ BASE_TEST_CONFIG=(
     --attention_layers_to_update 9 10 11
 )
 
+MODEL_TYPE='base'
+
 # 基础路径
 BASE_RESULTS_ROOT="/LD-FS/home/zhenhuachen/code/github/DeepMicroSeg/data/results1/MSC"
 
@@ -134,7 +136,7 @@ check_prerequisites() {
 # 函数：检查模型检查点是否存在
 check_checkpoint() {
     local train_number=$1
-    local checkpoint_path="${BASE_RESULTS_ROOT}/b_lm_sam_lora_fl_number_${train_number}/checkpoints/sam_lora_MSC/best.pt"
+    local checkpoint_path="${BASE_RESULTS_ROOT}/b_lm_sam_lora_${MODEL_TYPE}_number_${train_number}/checkpoints/sam_lora_MSC/best.pt"
     
     if [ ! -f "$checkpoint_path" ]; then
         print_error "检查点不存在: $checkpoint_path"
@@ -149,8 +151,8 @@ check_checkpoint() {
 # 函数：单个测试任务
 run_single_test() {
     local train_number=$1
-    local checkpoint_path="${BASE_RESULTS_ROOT}/b_lm_sam_lora_fl_number_${train_number}/checkpoints/sam_lora_MSC/best.pt"
-    local results_dir="${BASE_RESULTS_ROOT}/b_lm_sam_lora_fl_number_${train_number}/test"
+    local checkpoint_path="${BASE_RESULTS_ROOT}/b_lm_sam_lora_${MODEL_TYPE}_number_${train_number}/checkpoints/sam_lora_MSC/best.pt"
+    local results_dir="${BASE_RESULTS_ROOT}/b_lm_sam_lora_${MODEL_TYPE}_number_${train_number}/test"
     local log_file="${LOG_DIR}/test_MSC_number_${train_number}_$(date +%Y%m%d_%H%M%S).log"
     
     print_info "=========================================="
@@ -248,7 +250,7 @@ generate_summary() {
     echo "" >> "${summary_file}"
     
     for train_number in "${TEST_NUMBERS[@]}"; do
-        local results_dir="${BASE_RESULTS_ROOT}/b_lm_sam_lora_fl_number_${train_number}/test"
+        local results_dir="${BASE_RESULTS_ROOT}/b_lm_sam_lora_${MODEL_TYPE}_number_${train_number}/test"
         if [ -d "${results_dir}" ] && [ "$(ls -A ${results_dir} 2>/dev/null)" ]; then
             local result_count=$(ls -1 "${results_dir}" 2>/dev/null | wc -l)
             echo "✅ train_number=${train_number}: ${result_count} 个结果文件" >> "${summary_file}"
@@ -325,7 +327,7 @@ main() {
     # 显示结果目录
     print_info "测试结果保存在以下目录:"
     for train_number in "${TEST_NUMBERS[@]}"; do
-        local results_dir="${BASE_RESULTS_ROOT}/b_lm_sam_lora_fl_number_${train_number}/test"
+        local results_dir="${BASE_RESULTS_ROOT}/b_lm_sam_lora_${MODEL_TYPE}_number_${train_number}/test"
         if [ -d "${results_dir}" ]; then
             print_info "  - ${results_dir}"
         fi
